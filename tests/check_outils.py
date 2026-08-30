@@ -5,6 +5,7 @@ le constate côté serveur (aucune requête reçue), pas côté message d'erreur
 message d'erreur peut très bien arriver après que le mal est fait.
 """
 
+import json
 import os
 import sys
 import pathlib
@@ -755,6 +756,67 @@ try:
        "le message nomme le domaine concerné, pour aller vérifier")
 finally:
     ik.appel = vrai_appel
+
+# --- le détail des erreurs de validation ------------------------------------
+# L'API range dans `error.errors` un tableau qui NOMME l'attribut fautif et,
+# souvent, les valeurs acceptées. Sans lui, « Validation failed » n'apprend
+# rien : c'est ce qui m'a fait sonder à l'aveugle le 2026-08-30 alors que la
+# réponse contenait déjà la liste des valeurs possibles.
+neuf()
+faux_api.ETAT["force_code"] = 422
+faux_api.ETAT["force_corps"] = json.dumps({
+    "result": "error",
+    "error": {"code": "validation_failed", "description": "Validation failed",
+              "errors": [{"code": "validation_rule_in",
+                          "description": "The selected with.0 is invalid.",
+                          "context": {"attribute": "with.0",
+                                      "values": ["fields", "periods"]}}]}})
+leve(lambda: ik.outil_comptes({}), "with.0",
+     "une erreur de validation nomme l'attribut fautif")
+ok("fields" in _derniere_raison[0] and "periods" in _derniere_raison[0],
+   "et elle rend les valeurs acceptées : %r" % _derniere_raison[0][:200])
+
+# plusieurs erreurs : toutes doivent remonter, pas seulement la première
+neuf()
+faux_api.ETAT["force_code"] = 400
+faux_api.ETAT["force_corps"] = json.dumps({
+    "result": "error",
+    "error": {"code": "invalid_additional_field", "description": "bad fields",
+              "errors": [{"description": "champ A manquant"},
+                         {"description": "champ B invalide"}]}})
+leve(lambda: ik.outil_comptes({}), "champ A manquant", "la première erreur remonte")
+ok("champ B invalide" in _derniere_raison[0],
+   "la seconde aussi : on ne perd pas les erreurs suivantes")
+
+# --- le solde prépayé, et où le recharger -----------------------------------
+# La commande par l'API tire sur le crédit prépayé, jamais sur une carte
+# enregistrée — constaté le 2026-08-30. Un message qui dit « fonds
+# insuffisants » sans dire où les mettre laisse le lecteur devant un moteur de
+# recherche. On y met l'adresse.
+neuf()
+os.environ["INFOMANIAK_ACHAT"] = "1"
+# Compte épinglé : sans ça, le forçage frapperait l'appel de résolution de
+# compte, qui a lieu AVANT la commande — on mesurerait alors le mauvais chemin.
+os.environ["INFOMANIAK_ACCOUNT"] = "4242"
+faux_api.ETAT["force_code"] = 500
+faux_api.ETAT["force_corps"] = (
+    '{"result":"error","error":{"code":"insufficient_funds_prepaid_balance",'
+    '"description":"Insufficient funds prepaid balance"}}')
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+         "amount_total_excl_tax": 6.0}),
+     "manager.infomaniak.com/v3/invoicing/payment-methods",
+     "fonds insuffisants : le message donne l'adresse pour créditer")
+ok("prépayé" in _derniere_raison[0].lower(),
+   "et il explique que le paiement passe par le crédit prépayé")
+ok("INDÉTERMIN" not in _derniere_raison[0],
+   "ce n'est pas une issue indéterminée : le refus est net, rien n'a été commandé")
+
+# L'adresse doit aussi figurer dans la description de l'outil, pour qu'un
+# modèle la connaisse avant d'échouer, pas seulement après.
+ok("manager.infomaniak.com/v3/invoicing/payment-methods"
+   in ik.BY_NAME["commande_domaine"]["description"],
+   "la description de commande_domaine porte l'adresse de crédit")
 
 # une erreur métier ordinaire, elle, reste rendue telle quelle
 neuf()

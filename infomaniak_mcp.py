@@ -181,6 +181,27 @@ def appel(chemin, params=None, corps=None, methode=None, _ouvre=None):
             code_err = detail.get("code") or ""
             if code_err and code_err not in raison:
                 raison = "%s (%s)" % (raison, code_err) if raison else code_err
+            # `error.errors` nomme l'attribut fautif et, souvent, les valeurs
+            # acceptées. Le jeter revient à rendre « Validation failed » — un
+            # message qui envoie sonder à l'aveugle alors que la réponse
+            # portait déjà la réponse.
+            precisions = []
+            for e in (detail.get("errors") or [])[:6]:
+                if not isinstance(e, dict):
+                    continue
+                bout = e.get("description") or e.get("code") or ""
+                ctx = e.get("context") or {}
+                if isinstance(ctx, dict):
+                    attribut = ctx.get("attribute")
+                    if attribut and str(attribut) not in bout:
+                        bout = "%s [%s]" % (bout, attribut)
+                    valeurs = ctx.get("values")
+                    if isinstance(valeurs, list) and valeurs:
+                        bout += " — accepté : %s" % ", ".join(str(v) for v in valeurs[:20])
+                if bout:
+                    precisions.append(bout)
+            if precisions:
+                raison = "%s → %s" % (raison, " ; ".join(precisions))
         else:
             raison = str(detail or "")[:200]
         if code == 401:
@@ -353,6 +374,13 @@ def compte_par_defaut(donne=None):
 
 ACHAT_MAX_DEFAUT = 50.0
 PERIODE_MAX = 10
+
+# La commande par l'API se paie sur le **crédit prépayé** du compte, jamais sur
+# un moyen de paiement enregistré — constaté le 2026-08-30, l'API répondant
+# `insufficient_funds_prepaid_balance`. Aucun endpoint public ne permet de lire
+# ni de recharger ce solde : cela se fait dans le manager, et l'adresse mérite
+# d'être portée par l'outil plutôt que cherchée.
+CREDITER = "https://manager.infomaniak.com/v3/invoicing/payment-methods"
 
 
 def achat_arme():
@@ -707,6 +735,17 @@ def outil_commande_domaine(args):
                 "aboutir. NE PAS REJOUER — vérifier d'abord avec l'outil "
                 "« domaines », ou dans le manager, si le domaine figure "
                 "désormais au compte %s." % (nom, err, compte))
+        if "prepaid" in str(err).lower() or "insufficient_funds" in str(err).lower():
+            # Refus net : rien n'a été commandé. Dire où mettre l'argent, sinon
+            # le message renvoie le lecteur à un moteur de recherche.
+            raise ErreurInfomaniak(
+                "%s n'a pas été enregistré : le solde du compte prépayé est "
+                "insuffisant. La commande par l'API se paie sur ce crédit, "
+                "jamais sur un moyen de paiement enregistré. Le créditer ici : "
+                "%s — bouton « Créditer le compte ». Le montant demandé était "
+                "%.2f € HT ; prévoir aussi le renouvellement des années "
+                "suivantes. Rien n'a été commandé ni débité."
+                % (nom, CREDITER, total))
         raise
 
     # Le domaine vient d'entrer dans le compte : la liste d'appartenance
@@ -822,7 +861,12 @@ TOOLS = [
        "Enregistrer un domaine. Engage une dépense qui ne se défait pas. Exige "
        "un armement propre (INFOMANIAK_ACHAT=1), reste sous un plafond, et "
        "n'accepte que le montant que l'appelant a lu lui-même avec "
-       "« disponibilite » — il n'est jamais deviné.",
+       "« disponibilite » — il n'est jamais deviné. Le paiement se fait sur le "
+       "CRÉDIT PRÉPAYÉ du compte, jamais sur une carte enregistrée : si le "
+       "solde est insuffisant, le créditer sur " + CREDITER + " (bouton "
+       "« Créditer le compte »). Le jeton doit aussi porter les portées "
+       "domain:write, invoicing:prepaid:read, invoicing:order:write et "
+       "invoicing:payment:write.",
        {"domain": dict(S, description="le domaine à enregistrer"),
         "confirmation": dict(S, description="répéter exactement le même domaine"),
         "amount_total_excl_tax": {"type": "number",
@@ -865,8 +909,10 @@ def instructions():
         depense = (" L'enregistrement de domaine est ARMÉ : « commande_domaine » "
                    "engagera une dépense réelle. Le montant doit être lu avec "
                    "« disponibilite » et reporté tel quel — ne jamais l'inventer, "
-                   "l'API le vérifie. Ne jamais rejouer un appel dont l'issue "
-                   "est inconnue.")
+                   "l'API le vérifie. Le paiement se fait sur le crédit prépayé "
+                   "du compte, à créditer sur " + CREDITER + " si le solde "
+                   "manque. Ne jamais rejouer un appel dont l'issue est "
+                   "inconnue.")
     else:
         depense = (" L'enregistrement de domaine n'est PAS armé : "
                    "« commande_domaine » refusera, sans qu'aucune requête ne "
