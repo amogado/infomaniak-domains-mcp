@@ -1,4 +1,4 @@
-# infomaniak-mcp — notes pour l'agent
+# infomaniak-domains-mcp — notes pour l'agent
 
 ## Ce que c'est
 Un serveur MCP stdio, stdlib Python uniquement, qui opère les domaines et les

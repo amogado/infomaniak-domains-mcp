@@ -42,7 +42,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-NAME = "infomaniak"
+NAME = "infomaniak-domains"
 VERSION = "1.0.0"
 PROTOCOL = "2025-06-18"
 BASE = os.environ.get("INFOMANIAK_BASE", "https://api.infomaniak.com").rstrip("/")
@@ -219,6 +219,60 @@ def compte_par_defaut(donne=None):
                                % (premier,))
     _COMPTE["valeur"] = str(identifiant)
     return _COMPTE["valeur"]
+
+
+# --------------------------------------------------------------------------
+# l'achat — une classe à part
+# --------------------------------------------------------------------------
+#
+# Commander un domaine dépense de l'argent et ne s'annule pas. Ce n'est donc
+# pas une écriture de plus : c'est un geste d'une autre nature, avec son propre
+# armement, son propre plafond et sa propre confirmation.
+#
+# Quatre garde-fous indépendants — il faut les franchir tous :
+#
+#   1. INFOMANIAK_ACHAT=1, **distinct** de INFOMANIAK_WRITE. Armer le DNS
+#      n'arme pas la carte bancaire.
+#   2. Un plafond en euros hors taxes, INFOMANIAK_ACHAT_MAX, 50 par défaut. Il
+#      borne le dégât possible même quand tout le reste est armé.
+#   3. Le montant attendu est obligatoire et **jamais deviné**. Le serveur
+#      pourrait aller chercher le prix lui-même et le recopier dans la
+#      commande — c'est précisément ce qu'il ne faut pas faire : le contrôle
+#      `invalid_expected_amount` de l'API ne vaut que si le nombre vient de
+#      quelqu'un qui l'a vu.
+#   4. Une confirmation qui répète le nom du domaine, pour qu'une commande ne
+#      puisse pas se tromper de cible.
+#
+# Et une conduite, qui n'est pas un garde-fou : **on ne rejoue jamais un achat
+# dont l'issue est inconnue**. Un délai dépassé ne dit pas que la commande
+# n'est pas partie.
+
+ACHAT_MAX_DEFAUT = 50.0
+PERIODE_MAX = 10
+
+
+def achat_arme():
+    return os.environ.get("INFOMANIAK_ACHAT", "").strip() in ("1", "oui", "yes", "true")
+
+
+def plafond_achat():
+    """Le plafond en euros hors taxes. Une valeur illisible **refuse** au lieu
+    de retomber sur le défaut : un contrôle qui autorise une dépense doit se
+    fermer quand il ne se comprend pas lui-même."""
+    brut = os.environ.get("INFOMANIAK_ACHAT_MAX", "").strip()
+    if not brut:
+        return ACHAT_MAX_DEFAUT
+    try:
+        valeur = float(brut.replace(",", "."))
+    except ValueError:
+        raise ErreurInfomaniak(
+            "INFOMANIAK_ACHAT_MAX vaut %r, qui n'est pas un nombre. Aucune "
+            "commande n'est passée tant que le plafond est illisible." % brut)
+    if valeur <= 0:
+        raise ErreurInfomaniak(
+            "INFOMANIAK_ACHAT_MAX vaut %s : un plafond nul ou négatif "
+            "n'autorise aucune commande." % valeur)
+    return valeur
 
 
 def exige_ecriture(geste):

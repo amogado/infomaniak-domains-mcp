@@ -1,4 +1,4 @@
-# infomaniak-mcp
+# infomaniak-domains-mcp
 
 Un serveur MCP pour opérer ses domaines et ses zones DNS chez [Infomaniak](https://www.infomaniak.com) :
 lister ses domaines, savoir si un nom est libre et ce qu'il coûte, lire et
@@ -24,7 +24,7 @@ montant. Un test vérifie qu'aucun appel du code ne vise ces chemins.
 ## Installation
 
 ```bash
-git clone https://github.com/amogado/infomaniak-mcp.git ~/repos-mcp/infomaniak-mcp
+git clone https://github.com/amogado/infomaniak-domains-mcp.git ~/repos-mcp/infomaniak-domains-mcp
 ```
 
 Il n'y a rien à installer.
@@ -57,7 +57,7 @@ configuration. Il n'est jamais journalisé ni renvoyé dans une réponse d'outil
   "mcpServers": {
     "infomaniak": {
       "command": "python3",
-      "args": ["/Users/vous/repos-mcp/infomaniak-mcp/infomaniak_mcp.py"],
+      "args": ["/Users/vous/repos-mcp/infomaniak-domains-mcp/infomaniak_mcp.py"],
       "env": {
         "INFOMANIAK_TOKEN_CMD": "bw get password infomaniak-api --session \"$BW_SESSION\""
       }

@@ -2,7 +2,7 @@
   "mcpServers": {
     "infomaniak": {
       "command": "python3",
-      "args": ["/Users/amogado/repos-mcp/infomaniak-mcp/infomaniak_mcp.py"],
+      "args": ["/Users/amogado/repos-mcp/infomaniak-domains-mcp/infomaniak_mcp.py"],
       "env": {
         "INFOMANIAK_TOKEN_CMD": "bw get password infomaniak-api --session \"$BW_SESSION\""
       }

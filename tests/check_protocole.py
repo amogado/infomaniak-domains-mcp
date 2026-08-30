@@ -104,7 +104,7 @@ c = Client()
 r = c.demande("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
                              "clientInfo": {"name": "test", "version": "0"}})
 egal(r["result"]["protocolVersion"], "2025-06-18", "initialize : la version demandée est rendue")
-egal(r["result"]["serverInfo"]["name"], "infomaniak", "initialize : le nom du serveur")
+egal(r["result"]["serverInfo"]["name"], "infomaniak-domains", "initialize : le nom du serveur")
 ok(r["result"]["capabilities"]["tools"] is not None, "initialize : la capacité outils")
 ok("LECTURE SEULE" in r["result"]["instructions"],
    "initialize : les instructions annoncent la lecture seule")
