@@ -193,9 +193,19 @@ def appel(chemin, params=None, corps=None, methode=None, _ouvre=None):
                 "Infomaniak a refusé l'accès (403) : %s. Le jeton est valide "
                 "mais n'a pas la portée nécessaire pour ce geste." % (raison or "sans détail"))
         if code == 429:
+            # Ne pas substituer notre explication à la sienne. Ce message
+            # affirmait « plafond de 60 requêtes par minute atteint » quoi que
+            # réponde l'API — et le 2026-08-30 un 429 est arrivé après trois
+            # requêtes, sur un endpoint de commande. Une cause inventée envoie
+            # chercher au mauvais endroit ; on rend donc ce que l'API a dit, et
+            # on signale le plafond général comme une piste parmi d'autres.
             raise ErreurInfomaniak(
-                "Infomaniak a répondu 429 : plafond de %d requêtes par minute "
-                "atteint. Ce plafond ne se relève pas." % PLAFOND)
+                "Infomaniak a répondu 429 (trop de requêtes) : %s. Cela peut "
+                "venir du plafond général de %d par minute, mais certains "
+                "endpoints — la commande notamment — ont leur propre limite. "
+                "Réessayer plus tard, et constater l'état réel avant de rejouer "
+                "une opération qui engage quelque chose."
+                % (raison or "sans détail", PLAFOND))
         raise ErreurInfomaniak("l'API a répondu %d : %s" % (code, raison or "sans détail"))
 
     return enveloppe.get("data")

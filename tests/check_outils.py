@@ -353,8 +353,30 @@ leve(lambda: ik.outil_comptes({}), "domain:read", "un 401 nomme les portées à 
 faux_api.ETAT["force_code"] = 403
 leve(lambda: ik.outil_comptes({}), "portée", "un 403 parle de portée, pas de jeton")
 
+# Un 429 ne doit PAS affirmer une cause qu'on n'a pas mesurée. Le message
+# disait « plafond de 60 requêtes par minute atteint » quel que soit ce
+# qu'Infomaniak répondait — or le 2026-08-30 il est arrivé après trois requêtes.
+# Une explication inventée envoie chercher au mauvais endroit ; on rend donc ce
+# que l'API a dit, et on présente le plafond comme une piste, pas un verdict.
 faux_api.ETAT["force_code"] = 429
-leve(lambda: ik.outil_comptes({}), "minute", "un 429 nomme le plafond par minute")
+faux_api.ETAT["force_corps"] = ('{"result":"error","error":{"code":"too_many_requests",'
+                                '"description":"Order rate limit for this product"}}')
+leve(lambda: ik.outil_comptes({}), "Order rate limit for this product",
+     "un 429 rend ce que l'API a réellement dit")
+
+faux_api.ETAT["force_code"] = 429
+faux_api.ETAT["force_corps"] = ('{"result":"error","error":{"code":"too_many_requests",'
+                                '"description":"Order rate limit for this product"}}')
+_ = None
+try:
+    ik.outil_comptes({})
+except ik.ErreurInfomaniak as err:
+    _ = str(err)
+ok(_ is not None, "le 429 lève bien")
+ok("atteint" not in (_ or ""),
+   "le message n'affirme plus que le plafond « est atteint » : %r" % (_ or ""))
+ok("60" not in (_ or "") or "peut" in (_ or "").lower() or "piste" in (_ or "").lower(),
+   "s'il cite 60/minute, c'est comme une piste, pas comme un constat : %r" % (_ or ""))
 
 faux_api.ETAT["force_code"] = 200
 faux_api.ETAT["force_corps"] = "<html>maintenance</html>"
