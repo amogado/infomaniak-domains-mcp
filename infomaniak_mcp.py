@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+"""Serveur MCP pour opérer ses domaines et ses zones DNS chez Infomaniak.
+
+Stdlib uniquement : rien à installer, pas d'environnement virtuel, pas de
+dépendance à tenir à jour. Un fichier, un `python3`.
+
+Configuration, par variables d'environnement :
+
+    INFOMANIAK_TOKEN       le jeton d'API
+    INFOMANIAK_TOKEN_CMD   une commande qui l'imprime — à préférer : le secret
+                           ne traîne alors dans aucun fichier de configuration.
+                           Par exemple :
+                             bw get password infomaniak-api --session "$BW_SESSION"
+    INFOMANIAK_WRITE       « 1 » pour armer les outils qui écrivent. Absent,
+                           le serveur est en lecture seule et le dit.
+    INFOMANIAK_ACCOUNT     l'identifiant de compte à utiliser par défaut ;
+                           sinon il est résolu au premier appel qui en a besoin.
+
+Le jeton n'est jamais journalisé ni renvoyé dans une réponse d'outil.
+
+Deux choix structurants, tenus exprès :
+
+1. **Lecture seule par défaut.** Le DNS est un système vivant et visible de
+   l'extérieur : un enregistrement de travers retire un site du réseau, et
+   personne ne l'apprend avant que quelqu'un se plaigne. Écrire demande donc un
+   armement explicite, pas un oubli de configuration.
+
+2. **Aucun outil n'achète.** `POST /2/domains/accounts/{account}/create` et
+   `/transfer` engagent de l'argent. Ils ne sont pas exposés, à dessein : un
+   agent doit pouvoir dire « ce domaine est libre, il coûte tant », jamais le
+   commander. La commande se passe dans le manager, à la main, par un humain
+   qui voit le montant.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+NAME = "infomaniak"
+VERSION = "1.0.0"
+PROTOCOL = "2025-06-18"
+BASE = os.environ.get("INFOMANIAK_BASE", "https://api.infomaniak.com").rstrip("/")
+TIMEOUT = 30
+
+# L'API accepte 60 requêtes par minute, et ce plafond ne se relève pas. On le
+# tient nous-mêmes : mieux vaut attendre une seconde que récolter un 429 au
+# milieu d'une écriture de zone.
+PLAFOND = int(os.environ.get("INFOMANIAK_RATE", "60"))
+FENETRE = 60.0
+
+
+def ecriture_armee():
+    """Lue à chaque appel, pas au démarrage : on peut armer sans relancer."""
+    return os.environ.get("INFOMANIAK_WRITE", "").strip() in ("1", "oui", "yes", "true")
+
+
+class ErreurInfomaniak(Exception):
+    """Une erreur montrable telle quelle à l'utilisateur."""
+
+
+def jeton():
+    """Le secret, cherché au plus tard et jamais gardé plus que nécessaire."""
+    direct = os.environ.get("INFOMANIAK_TOKEN")
+    if direct:
+        return direct.strip()
+    commande = os.environ.get("INFOMANIAK_TOKEN_CMD")
+    if not commande:
+        return ""
+    try:
+        out = subprocess.run(commande, shell=True, capture_output=True, text=True,
+                             timeout=30)
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+
+class Cadence:
+    """Une fenêtre glissante. Bloque le temps qu'il faut plutôt que d'essuyer
+    un 429 — un refus au milieu d'une série d'écritures laisse la zone à
+    moitié modifiée, ce qui est pire que lent."""
+
+    def __init__(self, plafond, fenetre):
+        self.plafond = max(1, plafond)
+        self.fenetre = fenetre
+        self.appels = []
+        self.verrou = threading.Lock()
+
+    def attendre(self, maintenant=None, dormir=time.sleep):
+        with self.verrou:
+            t = time.monotonic() if maintenant is None else maintenant
+            self.appels = [a for a in self.appels if t - a < self.fenetre]
+            if len(self.appels) >= self.plafond:
+                repos = self.fenetre - (t - self.appels[0])
+                if repos > 0:
+                    dormir(repos)
+                    t += repos
+                    self.appels = [a for a in self.appels if t - a < self.fenetre]
+            self.appels.append(t)
+
+
+CADENCE = Cadence(PLAFOND, FENETRE)
+
+
+def appel(chemin, params=None, corps=None, methode=None, _ouvre=None):
+    """Un appel à l'API. Rend le contenu de `data`, ou lève ErreurInfomaniak
+    avec une raison lisible — jamais une trace de pile dans le fil."""
+    cle = jeton()
+    if not cle:
+        raise ErreurInfomaniak(
+            "aucun jeton d'API. Renseigner INFOMANIAK_TOKEN, ou "
+            "INFOMANIAK_TOKEN_CMD avec une commande qui l'imprime. Le jeton se "
+            "crée sur https://manager.infomaniak.com/v3/infomaniak-api")
+
+    url = BASE + chemin
+    if params:
+        propres = {k: v for k, v in params.items() if v is not None and v != ""}
+        if propres:
+            url += "?" + urllib.parse.urlencode(propres)
+
+    data = None
+    if corps is not None:
+        data = json.dumps(corps).encode("utf-8")
+    requete = urllib.request.Request(
+        url, data=data, method=methode or ("POST" if data else "GET"))
+    requete.add_header("Authorization", "Bearer " + cle)
+    requete.add_header("Content-Type", "application/json")
+    requete.add_header("Accept", "application/json")
+
+    CADENCE.attendre()
+    ouvre = _ouvre or urllib.request.urlopen
+    try:
+        with ouvre(requete, timeout=TIMEOUT) as reponse:
+            brut = reponse.read().decode("utf-8", "replace")
+            code = reponse.status
+    except urllib.error.HTTPError as err:
+        brut = err.read().decode("utf-8", "replace")
+        code = err.code
+    except urllib.error.URLError as err:
+        raise ErreurInfomaniak("l'API Infomaniak est injoignable sur %s : %s"
+                               % (BASE, err.reason))
+    except OSError as err:
+        raise ErreurInfomaniak("l'API Infomaniak est injoignable sur %s : %s"
+                               % (BASE, err))
+
+    if not brut.strip():
+        if code >= 400:
+            raise ErreurInfomaniak("l'API a répondu %d sans corps." % code)
+        return None
+    try:
+        enveloppe = json.loads(brut)
+    except ValueError:
+        raise ErreurInfomaniak(
+            "l'API a répondu autre chose que du JSON (HTTP %d). Début : %r"
+            % (code, brut[:160]))
+
+    if not isinstance(enveloppe, dict):
+        raise ErreurInfomaniak("réponse inattendue : %r" % brut[:160])
+
+    if enveloppe.get("result") != "success" or code >= 400:
+        detail = enveloppe.get("error")
+        if isinstance(detail, dict):
+            raison = detail.get("description") or detail.get("code") or ""
+            code_err = detail.get("code") or ""
+            if code_err and code_err not in raison:
+                raison = "%s (%s)" % (raison, code_err) if raison else code_err
+        else:
+            raison = str(detail or "")[:200]
+        if code == 401:
+            raise ErreurInfomaniak(
+                "Infomaniak a refusé le jeton (401). Vérifier INFOMANIAK_TOKEN "
+                "et ses portées : domain:read, dns:read, et dns:write pour "
+                "modifier une zone.")
+        if code == 403:
+            raise ErreurInfomaniak(
+                "Infomaniak a refusé l'accès (403) : %s. Le jeton est valide "
+                "mais n'a pas la portée nécessaire pour ce geste." % (raison or "sans détail"))
+        if code == 429:
+            raise ErreurInfomaniak(
+                "Infomaniak a répondu 429 : plafond de %d requêtes par minute "
+                "atteint. Ce plafond ne se relève pas." % PLAFOND)
+        raise ErreurInfomaniak("l'API a répondu %d : %s" % (code, raison or "sans détail"))
+
+    return enveloppe.get("data")
+
+
+# --------------------------------------------------------------------------
+# comptes
+# --------------------------------------------------------------------------
+
+_COMPTE = {"valeur": None}
+
+
+def compte_par_defaut(donne=None):
+    """L'identifiant de compte à employer. Certains chemins l'exigent — le
+    contrôle de disponibilité, notamment, qui est indexé par compte parce que
+    le prix dépend du contrat."""
+    if donne:
+        return donne
+    fixe = os.environ.get("INFOMANIAK_ACCOUNT", "").strip()
+    if fixe:
+        return fixe
+    if _COMPTE["valeur"]:
+        return _COMPTE["valeur"]
+    comptes = appel("/1/accounts") or []
+    if not comptes:
+        raise ErreurInfomaniak(
+            "aucun compte visible avec ce jeton : impossible de deviner quel "
+            "compte utiliser. Passer account, ou fixer INFOMANIAK_ACCOUNT.")
+    premier = comptes[0]
+    identifiant = premier.get("id") or premier.get("account_id")
+    if identifiant is None:
+        raise ErreurInfomaniak("le premier compte rendu par l'API n'a pas d'identifiant : %r"
+                               % (premier,))
+    _COMPTE["valeur"] = str(identifiant)
+    return _COMPTE["valeur"]
+
+
+def exige_ecriture(geste):
+    if not ecriture_armee():
+        raise ErreurInfomaniak(
+            "le serveur est en lecture seule : %s n'a pas été fait. Pour "
+            "l'autoriser, lancer le serveur avec INFOMANIAK_WRITE=1. C'est "
+            "délibéré : une zone DNS est visible de tout le réseau, et une "
+            "erreur d'écriture ne se voit qu'une fois le mal fait." % geste)
+
+
+# --------------------------------------------------------------------------
+# outils — lecture
+# --------------------------------------------------------------------------
+
+def outil_comptes(args):
+    """Les comptes visibles avec ce jeton."""
+    comptes = appel("/1/accounts") or []
+    return {"comptes": comptes, "nombre": len(comptes)}
+
+
+def outil_domaines(args):
+    """Les domaines du compte. `search` filtre, `tld` restreint à une extension."""
+    params = {
+        "account_id": args.get("account"),
+        "search": args.get("search"),
+        "tld": args.get("tld"),
+        "page": args.get("page"),
+        "per_page": args.get("per_page") or 100,
+    }
+    domaines = appel("/2/domains/domains", params=params) or []
+    return {"domaines": domaines, "nombre": len(domaines)}
+
+
+def outil_domaine(args):
+    """La fiche d'un domaine."""
+    nom = (args.get("domain") or "").strip()
+    if not nom:
+        raise ErreurInfomaniak("il faut un domaine dans domain.")
+    return appel("/2/domains/domains/" + urllib.parse.quote(nom, safe=""))
+
+
+def outil_disponibilite(args):
+    """Le domaine est-il libre, et à quel prix. C'est une lecture : elle
+    n'engage rien et ne réserve rien."""
+    nom = (args.get("domain") or "").strip().lower()
+    if not nom:
+        raise ErreurInfomaniak("il faut un domaine dans domain, par exemple « exemple.ch ».")
+    if "." not in nom:
+        raise ErreurInfomaniak(
+            "« %s » n'a pas d'extension. Le contrôle porte sur un domaine "
+            "complet, pas sur un radical." % nom)
+    compte = compte_par_defaut(args.get("account"))
+    corps = {"domain": nom, "with_option_prices": bool(args.get("with_option_prices"))}
+    data = appel("/2/domains/accounts/%s/check" % urllib.parse.quote(str(compte), safe=""),
+                 corps=corps, methode="POST")
+    return {"domaine": nom, "reponse": data}
+
+
+def outil_zones(args):
+    """Les zones d'un domaine : la zone de base et les zones déléguées."""
+    nom = (args.get("domain") or "").strip()
+    if not nom:
+        raise ErreurInfomaniak("il faut un domaine dans domain.")
+    zones = appel("/2/domains/domains/%s/zones" % urllib.parse.quote(nom, safe="")) or []
+    return {"zones": zones, "nombre": len(zones)}
+
+
+def outil_enregistrements(args):
+    """Les enregistrements DNS d'une zone."""
+    zone = (args.get("zone") or "").strip()
+    if not zone:
+        raise ErreurInfomaniak("il faut une zone dans zone (le fqdn, par exemple « exemple.ch »).")
+    params = {"with": "records_description", "per_page": args.get("per_page") or 500,
+              "page": args.get("page"), "search": args.get("search")}
+    liste = appel("/2/zones/%s/records" % urllib.parse.quote(zone, safe=""),
+                  params=params) or []
+    type_voulu = (args.get("type") or "").strip().upper()
+    if type_voulu:
+        liste = [r for r in liste if str(r.get("type", "")).upper() == type_voulu]
+    source_voulue = (args.get("source") or "").strip()
+    if source_voulue:
+        liste = [r for r in liste if str(r.get("source", "")) == source_voulue]
+    return {"zone": zone, "enregistrements": liste, "nombre": len(liste)}
+
+
+def outil_verifie_enregistrement(args):
+    """L'enregistrement existe-t-il vraiment sur les serveurs de noms ? C'est la
+    différence entre « écrit dans la zone » et « servi au réseau »."""
+    zone = (args.get("zone") or "").strip()
+    identifiant = args.get("record")
+    if not zone or identifiant in (None, ""):
+        raise ErreurInfomaniak("il faut zone et record (l'identifiant numérique).")
+    return appel("/2/zones/%s/records/%s/check"
+                 % (urllib.parse.quote(zone, safe=""),
+                    urllib.parse.quote(str(identifiant), safe="")))
+
+
+def outil_dnssec(args):
+    """L'état DNSSEC d'un domaine."""
+    nom = (args.get("domain") or "").strip()
+    if not nom:
+        raise ErreurInfomaniak("il faut un domaine dans domain.")
+    return appel("/2/domains/domains/%s/dnssec/check" % urllib.parse.quote(nom, safe=""))
+
+
+# --------------------------------------------------------------------------
+# outils — écriture (armés par INFOMANIAK_WRITE=1)
+# --------------------------------------------------------------------------
+
+TYPES = ("A", "AAAA", "CAA", "CNAME", "DNAME", "DS", "MX", "NS",
+         "SMIMEA", "SRV", "SSHFP", "TLSA", "TXT")
+
+
+def _ttl(valeur):
+    ttl = int(valeur if valeur not in (None, "") else 3600)
+    if not 60 <= ttl <= 86400:
+        raise ErreurInfomaniak(
+            "ttl doit tenir entre 60 et 86400 secondes ; reçu %d. C'est l'API "
+            "qui l'impose, pas nous." % ttl)
+    return ttl
+
+
+def outil_ajoute_enregistrement(args):
+    """Créer un enregistrement dans une zone."""
+    zone = (args.get("zone") or "").strip()
+    type_ = (args.get("type") or "").strip().upper()
+    cible = args.get("target")
+    if not zone:
+        raise ErreurInfomaniak("il faut une zone dans zone.")
+    if type_ not in TYPES:
+        raise ErreurInfomaniak("type doit être l'un de : %s. Reçu %r."
+                               % (", ".join(TYPES), args.get("type")))
+    if cible in (None, ""):
+        raise ErreurInfomaniak("il faut une cible dans target.")
+    ttl = _ttl(args.get("ttl"))
+    exige_ecriture("créer un %s dans %s" % (type_, zone))
+    corps = {"type": type_, "target": str(cible), "ttl": ttl}
+    source = args.get("source")
+    if source is not None:
+        corps["source"] = source
+    cree = appel("/2/zones/%s/records" % urllib.parse.quote(zone, safe=""),
+                 params={"with": "records_description"}, corps=corps, methode="POST")
+    return {"cree": cree}
+
+
+def outil_modifie_enregistrement(args):
+    """Modifier la cible ou le TTL d'un enregistrement. L'API ne permet pas d'en
+    changer le type ni la source : pour ça, supprimer et recréer."""
+    zone = (args.get("zone") or "").strip()
+    identifiant = args.get("record")
+    if not zone or identifiant in (None, ""):
+        raise ErreurInfomaniak("il faut zone et record (l'identifiant numérique).")
+    corps = {}
+    if args.get("target") not in (None, ""):
+        corps["target"] = str(args["target"])
+    if args.get("ttl") not in (None, ""):
+        corps["ttl"] = _ttl(args.get("ttl"))
+    if not corps:
+        raise ErreurInfomaniak("rien à modifier : donner target, ttl, ou les deux.")
+    exige_ecriture("modifier l'enregistrement %s de %s" % (identifiant, zone))
+    modifie = appel("/2/zones/%s/records/%s"
+                    % (urllib.parse.quote(zone, safe=""),
+                       urllib.parse.quote(str(identifiant), safe="")),
+                    params={"with": "records_description"}, corps=corps, methode="PUT")
+    return {"modifie": modifie}
+
+
+def outil_supprime_enregistrement(args):
+    """Supprimer un enregistrement."""
+    zone = (args.get("zone") or "").strip()
+    identifiant = args.get("record")
+    if not zone or identifiant in (None, ""):
+        raise ErreurInfomaniak("il faut zone et record (l'identifiant numérique).")
+    exige_ecriture("supprimer l'enregistrement %s de %s" % (identifiant, zone))
+    appel("/2/zones/%s/records/%s"
+          % (urllib.parse.quote(zone, safe=""),
+             urllib.parse.quote(str(identifiant), safe="")),
+          methode="DELETE")
+    return {"supprime": identifiant, "zone": zone}
+
+
+def outil_serveurs_de_noms(args):
+    """Changer les serveurs de noms d'un domaine. Geste lourd : il déplace
+    l'autorité entière du domaine, et la propagation prend des heures."""
+    nom = (args.get("domain") or "").strip()
+    serveurs = args.get("nameservers")
+    if not nom:
+        raise ErreurInfomaniak("il faut un domaine dans domain.")
+    if not isinstance(serveurs, list) or not serveurs:
+        raise ErreurInfomaniak("nameservers doit être une liste non vide de serveurs de noms.")
+    if len(serveurs) < 2:
+        raise ErreurInfomaniak(
+            "il faut au moins deux serveurs de noms : avec un seul, la moindre "
+            "panne rend le domaine introuvable.")
+    exige_ecriture("remplacer les serveurs de noms de %s" % nom)
+    return appel("/2/domains/domains/%s/nameservers" % urllib.parse.quote(nom, safe=""),
+                 corps={"nameservers": [str(s) for s in serveurs]}, methode="PUT")
+
+
+# --------------------------------------------------------------------------
+# table des outils
+# --------------------------------------------------------------------------
+
+def _o(nom, description, proprietes, requis, handler, ecrit=False):
+    titre = ("[écrit] " if ecrit else "") + description
+    return {
+        "name": nom,
+        "description": titre,
+        "inputSchema": {"type": "object", "properties": proprietes,
+                        "required": requis},
+        "handler": handler,
+    }
+
+
+S = {"type": "string"}
+E = {"type": "integer"}
+B = {"type": "boolean"}
+
+TOOLS = [
+    _o("comptes", "Les comptes Infomaniak visibles avec ce jeton.",
+       {}, [], outil_comptes),
+
+    _o("domaines", "Les domaines du compte, filtrables par recherche ou extension.",
+       {"search": dict(S, description="filtre sur le nom"),
+        "tld": dict(S, description="restreint à une extension, par exemple « ch »"),
+        "account": dict(S, description="identifiant de compte ; sinon le compte par défaut"),
+        "page": E, "per_page": E},
+       [], outil_domaines),
+
+    _o("domaine", "La fiche d'un domaine : expiration, statut, serveurs de noms.",
+       {"domain": dict(S, description="le domaine, par exemple « exemple.ch »")},
+       ["domain"], outil_domaine),
+
+    _o("disponibilite",
+       "Ce domaine est-il libre, et à quel prix. N'engage rien et ne réserve "
+       "rien : aucun outil de ce serveur ne peut acheter un domaine.",
+       {"domain": dict(S, description="le domaine complet, extension comprise"),
+        "with_option_prices": dict(B, description="inclure le prix des options"),
+        "account": dict(S, description="identifiant de compte ; sinon le compte par défaut")},
+       ["domain"], outil_disponibilite),
+
+    _o("zones", "Les zones DNS d'un domaine.",
+       {"domain": S}, ["domain"], outil_zones),
+
+    _o("enregistrements", "Les enregistrements DNS d'une zone, filtrables par type ou source.",
+       {"zone": dict(S, description="le fqdn de la zone"),
+        "type": dict(S, description="A, AAAA, CNAME, MX, TXT…"),
+        "source": dict(S, description="filtre exact sur la source"),
+        "search": S, "page": E, "per_page": E},
+       ["zone"], outil_enregistrements),
+
+    _o("verifie_enregistrement",
+       "L'enregistrement est-il vraiment servi par les serveurs de noms — ce "
+       "qui n'est pas la même chose qu'écrit dans la zone.",
+       {"zone": S, "record": dict(E, description="l'identifiant numérique")},
+       ["zone", "record"], outil_verifie_enregistrement),
+
+    _o("dnssec", "L'état DNSSEC d'un domaine.",
+       {"domain": S}, ["domain"], outil_dnssec),
+
+    _o("ajoute_enregistrement", "Créer un enregistrement DNS.",
+       {"zone": S,
+        "type": dict(S, enum=list(TYPES)),
+        "source": dict(S, description="le sous-domaine, vide ou « . » pour la racine"),
+        "target": dict(S, description="la cible, par exemple « 95.217.21.250 »"),
+        "ttl": dict(E, description="entre 60 et 86400 ; 3600 par défaut")},
+       ["zone", "type", "target"], outil_ajoute_enregistrement, ecrit=True),
+
+    _o("modifie_enregistrement", "Modifier la cible ou le TTL d'un enregistrement.",
+       {"zone": S, "record": E, "target": S, "ttl": E},
+       ["zone", "record"], outil_modifie_enregistrement, ecrit=True),
+
+    _o("supprime_enregistrement", "Supprimer un enregistrement DNS.",
+       {"zone": S, "record": E},
+       ["zone", "record"], outil_supprime_enregistrement, ecrit=True),
+
+    _o("serveurs_de_noms",
+       "Remplacer les serveurs de noms d'un domaine. Déplace l'autorité entière ; "
+       "la propagation prend des heures.",
+       {"domain": S, "nameservers": {"type": "array", "items": S,
+                                     "description": "au moins deux"}},
+       ["domain", "nameservers"], outil_serveurs_de_noms, ecrit=True),
+]
+
+BY_NAME = {t["name"]: t for t in TOOLS}
+
+
+# --------------------------------------------------------------------------
+# protocole
+# --------------------------------------------------------------------------
+
+def result(text, is_error=False):
+    return {"content": [{"type": "text", "text": text}], "isError": is_error}
+
+
+def instructions():
+    etat = ("Les outils d'écriture sont armés."
+            if ecriture_armee() else
+            "Le serveur est en LECTURE SEULE : les outils marqués [écrit] "
+            "refuseront d'agir tant que INFOMANIAK_WRITE=1 n'est pas posé.")
+    return ("Opère les domaines et les zones DNS d'un compte Infomaniak : "
+            "lister les domaines, contrôler la disponibilité et le prix d'un "
+            "nom, lire et modifier les enregistrements DNS. " + etat +
+            " Aucun outil n'achète ni ne transfère de domaine : ces gestes "
+            "engagent de l'argent et se font à la main dans le manager.")
+
+
+def handle(message):
+    """Rend la réponse à envoyer, ou None pour une notification."""
+    methode = message.get("method")
+    mid = message.get("id")
+    params = message.get("params") or {}
+
+    if methode == "initialize":
+        demande = params.get("protocolVersion")
+        return {"protocolVersion": demande if isinstance(demande, str) and demande else PROTOCOL,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": NAME, "version": VERSION},
+                "instructions": instructions()}
+
+    if methode in ("notifications/initialized", "notifications/cancelled"):
+        return None
+
+    if methode == "ping":
+        return {}
+
+    if methode == "tools/list":
+        return {"tools": [{k: v for k, v in t.items() if k != "handler"} for t in TOOLS]}
+
+    if methode == "tools/call":
+        nom = params.get("name")
+        outil = BY_NAME.get(nom)
+        if not outil:
+            return result("Cet outil n'existe pas : %r. Outils disponibles : %s."
+                          % (nom, ", ".join(sorted(BY_NAME))), True)
+        args = params.get("arguments")
+        args = args if isinstance(args, dict) else {}
+        try:
+            return result(json.dumps(outil["handler"](args), ensure_ascii=False, indent=1))
+        except ErreurInfomaniak as err:
+            return result(str(err), True)
+        except Exception as err:                     # noqa: BLE001
+            # Un outil qui plante ne doit pas emporter le serveur : le client
+            # perdrait la session entière pour une erreur d'un seul appel.
+            return result("%s a échoué : %s: %s" % (nom, type(err).__name__, err), True)
+
+    if mid is None:
+        return None
+    raise ErreurInfomaniak("méthode inconnue : %s" % methode)
+
+
+def main():
+    sortie = sys.stdout
+    for ligne in sys.stdin:
+        ligne = ligne.strip()
+        if not ligne:
+            continue
+        try:
+            message = json.loads(ligne)
+        except ValueError:
+            continue
+        mid = message.get("id")
+        try:
+            charge = handle(message)
+        except ErreurInfomaniak as err:
+            if mid is not None:
+                sortie.write(json.dumps({"jsonrpc": "2.0", "id": mid,
+                                         "error": {"code": -32601, "message": str(err)}}) + "\n")
+                sortie.flush()
+            continue
+        if mid is None or charge is None:
+            continue
+        sortie.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": charge},
+                                ensure_ascii=False) + "\n")
+        sortie.flush()
+
+
+if __name__ == "__main__":
+    main()
