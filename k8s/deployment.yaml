@@ -1,0 +1,157 @@
+# ---------------------------------------------------------------------------
+# Le connecteur Infomaniak, dans le tenant homa `infomaniak-domains`.
+#
+# Aucune image à publier : `python:3.12-alpine` nu, et le code monté depuis un
+# ConfigMap. « Déployer » = réappliquer un ConfigMap et redémarrer le pod, ce
+# qui garde le dépôt comme seule source de vérité — il n'existe pas d'image
+# intermédiaire capable de diverger de lui.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: infomaniak-domains
+spec:
+  replicas: 1
+  # Recreate, pas RollingUpdate. Le PVC est ReadWriteOnce : en rolling, le
+  # pod neuf attend un volume que l'ancien tient encore, et le rollout expire
+  # au lieu d'aboutir. Une seconde d'indisponibilité vaut mieux qu'un blocage
+  # qu'on ne comprend qu'après avoir lu les events.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: infomaniak-domains
+  template:
+    metadata:
+      labels:
+        app: infomaniak-domains
+    spec:
+      # Kubernetes injecte une variable d'environnement par Service du
+      # namespace, en majuscules : le Service `infomaniak-domains` poserait
+      # INFOMANIAK_DOMAINS_PORT, INFOMANIAK_DOMAINS_SERVICE_HOST… Or toute la
+      # configuration du serveur vit sous le préfixe INFOMANIAK_. Rien ne se
+      # heurte aujourd'hui, mais un Service ajouté plus tard pourrait fabriquer
+      # une collision qu'aucun test ne verrait. On coupe l'injection : le seul
+      # environnement du conteneur est celui écrit ci-dessous.
+      enableServiceLinks: false
+      # Le serveur ne parle jamais à l'API Kubernetes. Monter un jeton de compte
+      # de service ne lui servirait à rien et donnerait une prise de plus à qui
+      # obtiendrait l'exécution de code — ce pod-ci est joignable depuis
+      # Internet.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        # Sans fsGroup, le PVC appartient à root et l'uid 1000 ne peut pas y
+        # écrire : l'état OAuth ne serait pas persisté, donc les codes
+        # deviendraient rejouables au redémarrage.
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: connecteur
+          image: python:3.12-alpine
+          # serveur.py importe infomaniak_mcp depuis le MÊME répertoire : les
+          # deux fichiers viennent d'un seul ConfigMap, donc d'un seul montage.
+          # Les séparer en deux ConfigMaps casserait l'import — et c'est
+          # justement cet import qui garantit qu'il n'existe qu'une définition
+          # des outils.
+          command: ["python3", "/app/serveur.py"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            # Toutes les URL absolues des documents de découverte OAuth en
+            # viennent — jamais de l'en-tête Host, qu'un client peut forger.
+            - name: INFOMANIAK_PUBLIC_BASE
+              value: https://domaines.ephais.eu
+            # Une frontière, pas un défaut : le jeton voit potentiellement
+            # d'autres comptes, et les zones DNS s'adressent par nom. Épinglé,
+            # le serveur ne peut pas toucher la zone de quelqu'un d'autre.
+            - name: INFOMANIAK_ACCOUNT
+              value: "607373"
+            # INFOMANIAK_WRITE et INFOMANIAK_ACHAT sont ABSENTS, et c'est
+            # délibéré : ce serveur est lecture seule. Les armer se décide par
+            # un patch explicite du Deployment — jamais par un oubli, jamais en
+            # même temps que la mise en ligne. Un enregistrement DNS de travers
+            # retire un site du réseau sans que personne l'apprenne avant qu'on
+            # se plaigne.
+            - name: INFOMANIAK_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  # Secret HORS DÉPÔT. Sa création, sans que le jeton traverse
+                  # un fichier ni une sortie lisible : voir deploy.sh.
+                  name: infomaniak-token
+                  key: token
+            - name: INFOMANIAK_LISTEN_PORT
+              value: "8080"
+            # La racine est en lecture seule : sans HOME habitable, une routine
+            # stdlib qui cherche un fichier de configuration utilisateur lève
+            # au lieu de ne rien trouver.
+            - name: HOME
+              value: /tmp
+            # /app est un ConfigMap, donc en lecture seule : Python ne pourra
+            # pas y déposer les .pyc. Il l'accepte en silence, mais l'écrire
+            # ici évite d'avoir à se le redemander.
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            # Sans ça, les journaux d'un conteneur qui n'a pas de terminal
+            # restent dans le tampon : on ne voit une erreur de démarrage
+            # qu'au moment où le processus meurt.
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 192Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            timeoutSeconds: 1
+            periodSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - name: app
+              mountPath: /app
+            - name: data
+              mountPath: /data
+            # readOnlyRootFilesystem coupe /tmp avec le reste. Python en a
+            # besoin dès qu'il ouvre un fichier temporaire.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: app
+          configMap:
+            name: infomaniak-domains-app
+        - name: data
+          persistentVolumeClaim:
+            claimName: infomaniak-domains-data
+        - name: tmp
+          emptyDir: {}
+---
+# L'état OAuth : codes émis, jetons, familles de rafraîchissement.
+#
+# Un code non persisté est un code rejouable indéfiniment — c'est pour ça que
+# cet état ne peut pas vivre en mémoire, et pour ça que le volume est le seul
+# endroit du déploiement où le pod a le droit d'écrire.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: infomaniak-domains-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn-2r
+  resources:
+    requests:
+      storage: 1Gi

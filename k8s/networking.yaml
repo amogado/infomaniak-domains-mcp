@@ -1,0 +1,159 @@
+# ---------------------------------------------------------------------------
+# Deux Services vers le MÊME pod, et c'est tout l'intérêt.
+#
+# Le jour où l'authentification humaine passera par un side-car (oauth2-proxy),
+# le Service `infomaniak-domains` pointera vers le port du side-car. Si
+# l'Ingress du connecteur visait encore ce Service, les sept chemins machine se
+# retrouveraient DERRIÈRE l'authentification humaine — et Claude, qui appelle
+# depuis le cloud sans navigateur, ne pourrait plus jamais se connecter.
+#
+# Les séparer dès maintenant fait qu'une telle bascule ne touche qu'un seul
+# Service, et que check_frontiere.sh dit immédiatement si elle a débordé.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: infomaniak-domains
+spec:
+  type: ClusterIP
+  selector:
+    app: infomaniak-domains
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infomaniak-domains-direct
+spec:
+  type: ClusterIP
+  selector:
+    app: infomaniak-domains
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+---
+# Le Secret infomaniak-domains-basicauth n'est PAS dans ce dépôt.
+# Sa création — le mot de passe ne quitte jamais le terminal — est dans
+# deploy.sh, qui refuse de déployer tant qu'il manque.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: infomaniak-domains-auth
+spec:
+  basicAuth:
+    secret: infomaniak-domains-basicauth
+    realm: domaines
+---
+# L'Ingress humain : tout le reste du site, derrière Basic Auth.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: infomaniak-domains
+  annotations:
+    # L'issuer vit ICI et nulle part ailleurs. Deux Ingress porteurs d'un issuer
+    # sur un même hôte font deux commandes Let's Encrypt pour un seul
+    # certificat, donc deux fois le quota pour rien.
+    cert-manager.io/issuer: letsencrypt
+    traefik.ingress.kubernetes.io/router.middlewares: infomaniak-domains-default-infomaniak-domains-auth@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - domaines.ephais.eu
+      secretName: infomaniak-domains-tls
+  rules:
+    - host: domaines.ephais.eu
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: infomaniak-domains
+                port:
+                  number: 80
+---
+# ---------------------------------------------------------------------------
+# La frontière du connecteur.
+#
+# Claude appelle /mcp, /token, /register et les documents de découverte depuis
+# le cloud, SANS identifiants Basic. Ces sept chemins — et EUX SEULS — sortent
+# donc du middleware d'authentification. Tout le reste (/, /authorize,
+# /consent, /healthz) reste derrière.
+#
+# pathType: Exact, JAMAIS Prefix. Traefik traduit Prefix en PathPrefix(), qui
+# est un préfixe de CHAÎNE et non de segment : exempter « /mcp » en Prefix
+# exempterait aussi /mcpXXX, et toute route future sous un chemin exempté
+# deviendrait publique en silence. tests/check_frontiere.sh le vérifie depuis
+# l'extérieur, sans mot de passe — un `curl -u` ne dirait rien de ce qu'un
+# inconnu peut atteindre.
+# ---------------------------------------------------------------------------
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: infomaniak-domains-mcp-ratelimit
+spec:
+  rateLimit:
+    average: 20
+    burst: 40
+    period: 1s
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: infomaniak-domains-mcp-inflight
+spec:
+  inFlightReq:
+    amount: 20
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: infomaniak-domains-mcp
+  annotations:
+    # PAS de cert-manager.io/issuer ici : le certificat est commandé par
+    # l'Ingress humain, sur le même hôte. PAS de -auth non plus : c'est tout
+    # l'objet de cet Ingress.
+    traefik.ingress.kubernetes.io/router.middlewares: infomaniak-domains-default-infomaniak-domains-mcp-ratelimit@kubernetescrd,infomaniak-domains-default-infomaniak-domains-mcp-inflight@kubernetescrd
+    # Priorité explicite : Traefik trie par longueur de règle, et l'écart entre
+    # Path(/mcp) et PathPrefix(/) est trop serré pour qu'on lui confie la
+    # frontière. Si l'Ingress humain gagnait, /mcp repasserait derrière Basic
+    # Auth et le connecteur tomberait sans que rien n'ait changé de visible.
+    traefik.ingress.kubernetes.io/router.priority: "1000"
+spec:
+  ingressClassName: traefik
+  tls:
+    # On s'y réfère seulement : ce secret est rempli par l'Ingress humain, qui
+    # porte l'issuer.
+    - hosts:
+        - domaines.ephais.eu
+      secretName: infomaniak-domains-tls
+  rules:
+    - host: domaines.ephais.eu
+      http:
+        paths:
+          - path: /mcp
+            pathType: Exact
+            backend: {service: {name: infomaniak-domains-direct, port: {number: 80}}}
+          - path: /token
+            pathType: Exact
+            backend: {service: {name: infomaniak-domains-direct, port: {number: 80}}}
+          - path: /register
+            pathType: Exact
+            backend: {service: {name: infomaniak-domains-direct, port: {number: 80}}}
+          - path: /.well-known/oauth-protected-resource
+            pathType: Exact
+            backend: {service: {name: infomaniak-domains-direct, port: {number: 80}}}
+          - path: /.well-known/oauth-protected-resource/mcp
+            pathType: Exact
+            backend: {service: {name: infomaniak-domains-direct, port: {number: 80}}}
+          - path: /.well-known/oauth-authorization-server
+            pathType: Exact
+            backend: {service: {name: infomaniak-domains-direct, port: {number: 80}}}
+          - path: /.well-known/openid-configuration
+            pathType: Exact
+            backend: {service: {name: infomaniak-domains-direct, port: {number: 80}}}
