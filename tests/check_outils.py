@@ -301,6 +301,25 @@ faux_api.ETAT["force_code"] = 500
 faux_api.ETAT["force_corps"] = '{"result":"error","error":{"code":"boum","description":""}}'
 leve(lambda: ik.outil_comptes({}), "boum", "un code d'erreur sans description reste visible")
 
+# Le cas qui pique : HTTP 200, mais `result` vaut "error". L'API le fait, et
+# ne regarder que le code HTTP ferait passer l'échec pour un succès — avec un
+# `data` absent, donc une liste vide rendue comme si tout allait bien.
+faux_api.ETAT["force_code"] = 200
+faux_api.ETAT["force_corps"] = ('{"result":"error","error":{"code":"quota_exceeded",'
+                                '"description":"trop de zones"}}')
+leve(lambda: ik.outil_comptes({}), "trop de zones",
+     "un 200 porteur de result=error est bien traité comme une erreur")
+
+faux_api.ETAT["force_code"] = 200
+faux_api.ETAT["force_corps"] = '{"result":"error","error":{"code":"quota_exceeded"}}'
+leve(lambda: ik.outil_comptes({}), "quota_exceeded",
+     "un 200 en erreur sans description montre au moins le code")
+
+# assertion inverse : un vrai succès en 200 passe toujours
+faux_api.ETAT["force_code"] = 200
+faux_api.ETAT["force_corps"] = '{"result":"success","data":[{"id":1}]}'
+egal(ik.outil_comptes({})["nombre"], 1, "un 200 en succès passe toujours")
+
 # sans jeton du tout : le message doit dire où en créer un
 neuf()
 garde = os.environ.pop("INFOMANIAK_TOKEN")
@@ -338,6 +357,25 @@ for i in range(3):
 avant = len(dormi)
 c2.attendre(maintenant=200.0, dormir=dormi.append)
 egal(len(dormi), avant, "la fenêtre est glissante : passé 60 s, on repart libre")
+
+# Et elle doit freiner *de nouveau* dans la fenêtre suivante. Sans cet examen,
+# une cadence qui n'élague jamais reste verte : les vieux horodatages gonflent
+# la liste, le repos calculé devient négatif, et la garde « repos > 0 » avale
+# silencieusement l'absence de freinage. C'est-à-dire qu'on ne freine plus
+# jamais après la première minute — exactement le contraire du but.
+c3 = ik.Cadence(3, 60.0)
+for t in (100.0, 101.0, 102.0):
+    c3.attendre(maintenant=t, dormir=dormi.append)
+for t in (200.0, 201.0, 202.0):
+    c3.attendre(maintenant=t, dormir=dormi.append)
+avant = len(dormi)
+c3.attendre(maintenant=203.0, dormir=dormi.append)
+egal(len(dormi), avant + 1, "la fenêtre suivante freine elle aussi")
+ok(abs(dormi[-1] - 57.0) < 0.001,
+   "et elle freine du bon montant, calculé sur la fenêtre courante : %r" % dormi[-1])
+ok(len(c3.appels) <= 3,
+   "les horodatages périmés sont élagués : %d retenus pour un plafond de 3"
+   % len(c3.appels))
 
 
 # ------------------------------------------------------- la table des outils
