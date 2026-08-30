@@ -40,15 +40,35 @@ portées minimales :
 | `dns:read` | lire les zones et les enregistrements |
 | `dns:write` | modifier les enregistrements — inutile si on reste en lecture |
 
-Deux façons de le fournir :
+Le serveur ne veut pas du jeton lui-même : il veut une **commande qui
+l'imprime**, `INFOMANIAK_TOKEN_CMD`, exécutée au dernier moment. Le secret ne
+figure alors dans aucun fichier de configuration, et il n'est jamais journalisé
+ni renvoyé dans une réponse d'outil.
+
+**Sur macOS, le trousseau est la meilleure source.** Il s'ouvre avec la session
+de l'utilisateur, donc la lecture ne demande aucun déverrouillage séparé et
+fonctionne depuis n'importe quel shell :
 
 ```bash
-export INFOMANIAK_TOKEN="…"                 # simple, mais le secret traîne
+# le ranger — copier le jeton dans le presse-papier d'abord, pour qu'il
+# n'apparaisse ni dans la ligne de commande ni dans l'historique
+security add-generic-password -U -a "$USER" -s infomaniak-api -w "$(pbpaste)"
+
+export INFOMANIAK_TOKEN_CMD='security find-generic-password -w -s infomaniak-api'
+```
+
+Avec un gestionnaire de mots de passe déverrouillable par session, comme
+Bitwarden, la commande marche aussi — mais attention au piège : `bw` exige un
+`BW_SESSION`, et une variable exportée dans un shell **n'atteint pas** un
+processus lancé ailleurs. Le jeton de session doit exister dans
+l'environnement qui démarre le client MCP, pas dans un shell voisin.
+
+```bash
 export INFOMANIAK_TOKEN_CMD='bw get password infomaniak-api --session "$BW_SESSION"'
 ```
 
-La seconde est préférable : le jeton ne figure alors dans aucun fichier de
-configuration. Il n'est jamais journalisé ni renvoyé dans une réponse d'outil.
+En dernier recours, `INFOMANIAK_TOKEN` accepte le jeton en clair — au prix
+d'un secret qui traîne dans un fichier.
 
 ## Configuration MCP
 
