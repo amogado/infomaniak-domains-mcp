@@ -8,6 +8,7 @@ portent un identifiant de compte, et laisserait grande ouverte la porte par
 laquelle on casse vraiment quelque chose.
 """
 
+import json
 import os
 import sys
 import pathlib
@@ -97,6 +98,29 @@ egal(len(faux_api.requetes(chemin_contient="/check")), 0,
 r = ik.outil_disponibilite({"domain": "x.fr", "account": "607373"})
 egal(faux_api.requetes(chemin_contient="/check")[-1]["chemin"],
      "/2/domains/accounts/607373/check", "le compte épinglé, redonné, passe")
+
+# --------------- epingle, « comptes » ne montre plus que le compte epingle
+# Trouve en balayant les quinze outils un par un : quatorze refusaient une cible
+# etrangere, `comptes` rendait encore les trois — donc les noms des comptes de
+# tiers. Un serveur borne a un compte n'a pas a reveler l'existence des autres.
+deux_comptes()
+r = ik.outil_comptes({})
+egal(r["nombre"], 1, "epingle : un seul compte est rendu")
+egal([str(c.get("id")) for c in r["comptes"]], ["607373"],
+     "et c'est le compte epingle")
+ok("Un tiers" not in json.dumps(r, ensure_ascii=False),
+   "le nom d'un compte tiers n'apparait nulle part")
+ok(r.get("epingle") is True, "et la reponse dit qu'elle est bornee")
+
+# Sans epinglage, l'outil garde son role de diagnostic : il montre tout.
+faux_api.remise_a_zero()
+ik._COMPTE["valeur"] = None
+ik._DOMAINES_DU_COMPTE.clear()
+os.environ["INFOMANIAK_ACCOUNT"] = ""
+faux_api.ETAT["comptes"] = [{"id": 90812, "name": "Un tiers"},
+                            {"id": 607373, "name": "Le notre"}]
+r = ik.outil_comptes({})
+egal(r["nombre"], 2, "sans epinglage, les comptes visibles sont tous rendus")
 
 # ------------------- l'argument account ne contourne AUCUN outil, pas juste un
 # Trouvé par audit adverse le 2026-08-31, et c'était réel : `outil_domaines`

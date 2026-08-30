@@ -424,9 +424,23 @@ def exige_ecriture(geste):
 # --------------------------------------------------------------------------
 
 def outil_comptes(args):
-    """Les comptes visibles avec ce jeton."""
+    """Les comptes visibles avec ce jeton — bornés à l'épinglage s'il existe.
+
+    Un serveur borné à un compte n'a pas à révéler l'existence des autres. Sans
+    ce filtre, l'outil rendait les noms des comptes de tiers alors que les
+    quatorze autres outils refusaient déjà toute cible étrangère : la frontière
+    tenait partout sauf sur la porte qui l'annonce.
+
+    Sans épinglage, l'outil garde son rôle de diagnostic — c'est lui qui sert à
+    trouver l'identifiant à épingler.
+    """
     comptes = appel("/1/accounts") or []
-    return {"comptes": comptes, "nombre": len(comptes)}
+    epingle = compte_epingle()
+    if not epingle:
+        return {"comptes": comptes, "nombre": len(comptes)}
+    retenus = [c for c in comptes
+               if str(c.get("id") or c.get("account_id")) == epingle]
+    return {"comptes": retenus, "nombre": len(retenus), "epingle": True}
 
 
 def outil_domaines(args):
