@@ -212,11 +212,26 @@ def compte_par_defaut(donne=None):
         raise ErreurInfomaniak(
             "aucun compte visible avec ce jeton : impossible de deviner quel "
             "compte utiliser. Passer account, ou fixer INFOMANIAK_ACCOUNT.")
-    premier = comptes[0]
-    identifiant = premier.get("id") or premier.get("account_id")
+
+    # Un jeton peut voir plusieurs comptes — c'est le cas courant dès qu'on
+    # gère les domaines de tiers. Prendre le premier serait tirer au sort
+    # lequel sera facturé, et le tirage ne se verrait nulle part. Un contrôle
+    # qui désigne une cible de dépense doit se fermer quand il ne sait pas.
+    if len(comptes) > 1:
+        liste = ", ".join(
+            "%s (%s)" % (c.get("id") or c.get("account_id"), c.get("name") or "sans nom")
+            for c in comptes)
+        raise ErreurInfomaniak(
+            "ce jeton voit plusieurs comptes et rien ne dit lequel employer : "
+            "%s. Choisir explicitement — paramètre account, ou variable "
+            "INFOMANIAK_ACCOUNT. Le serveur ne tranche pas à votre place : sur "
+            "une commande, ce choix décide qui est facturé." % liste)
+
+    seul = comptes[0]
+    identifiant = seul.get("id") or seul.get("account_id")
     if identifiant is None:
-        raise ErreurInfomaniak("le premier compte rendu par l'API n'a pas d'identifiant : %r"
-                               % (premier,))
+        raise ErreurInfomaniak("le compte rendu par l'API n'a pas d'identifiant : %r"
+                               % (seul,))
     _COMPTE["valeur"] = str(identifiant)
     return _COMPTE["valeur"]
 

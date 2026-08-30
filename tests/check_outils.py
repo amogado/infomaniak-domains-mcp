@@ -173,6 +173,44 @@ egal(len(faux_api.requetes(chemin_contient="/1/accounts")), 0,
 egal(faux_api.requetes(chemin_contient="/check")[-1]["chemin"],
      "/2/domains/accounts/777/check", "le compte fixé est employé")
 
+# Plusieurs comptes : la résolution automatique doit REFUSER, pas choisir.
+# Constaté en vrai le 2026-08-30 — le jeton voyait trois comptes, et prendre le
+# premier revenait à tirer au sort lequel serait facturé. Un contrôle qui
+# désigne une cible de dépense doit se fermer quand il ne sait pas.
+neuf()
+faux_api.ETAT["comptes"] = [{"id": 90812, "name": "Un tiers"},
+                            {"id": 607373, "name": "Le bon compte"}]
+leve(lambda: ik.outil_disponibilite({"domain": "kiosquier.ch"}), "plusieurs comptes",
+     "plusieurs comptes sans choix : refus")
+ik._COMPTE["valeur"] = None
+leve(lambda: ik.outil_disponibilite({"domain": "kiosquier.ch"}), "607373",
+     "le refus énumère les comptes, pour qu'on puisse trancher")
+egal(len(faux_api.requetes(chemin_contient="/check")), 0,
+     "le refus est arrivé avant tout appel de contrôle")
+
+# ... mais un choix explicite passe, et c'est bien celui-là qui est employé
+r = ik.outil_disponibilite({"domain": "kiosquier.ch", "account": "607373"})
+egal(faux_api.requetes(chemin_contient="/check")[-1]["chemin"],
+     "/2/domains/accounts/607373/check", "le compte choisi est employé")
+egal(r["reponse"]["available"], True, "et le contrôle aboutit")
+
+# un compte fixé par l'environnement lève aussi l'ambiguïté
+neuf()
+faux_api.ETAT["comptes"] = [{"id": 90812, "name": "Un tiers"},
+                            {"id": 607373, "name": "Le bon compte"}]
+os.environ["INFOMANIAK_ACCOUNT"] = "607373"
+ik.outil_disponibilite({"domain": "kiosquier.ch"})
+egal(faux_api.requetes(chemin_contient="/check")[-1]["chemin"],
+     "/2/domains/accounts/607373/check",
+     "INFOMANIAK_ACCOUNT lève l'ambiguïté sans rien demander")
+
+# un seul compte : pas d'ambiguïté, donc pas de refus
+neuf()
+ik.outil_disponibilite({"domain": "kiosquier.ch"})
+egal(faux_api.requetes(chemin_contient="/check")[-1]["chemin"],
+     "/2/domains/accounts/4242/check",
+     "un compte unique reste résolu automatiquement")
+
 
 # ------------------------------------------------- le garde-fou d'écriture
 # Sans armement : aucune requête ne doit partir. On le constate côté serveur.
