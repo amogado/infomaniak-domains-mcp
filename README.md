@@ -7,7 +7,7 @@ modifier les enregistrements DNS.
 Stdlib Python uniquement. Un fichier, un `python3`. Pas d'environnement
 virtuel, pas de dépendance à tenir à jour.
 
-## Deux choix tenus exprès
+## Trois choix tenus exprès
 
 **Lecture seule par défaut.** Une zone DNS est visible de tout le réseau, et un
 enregistrement de travers retire un site sans que personne l'apprenne avant
@@ -15,11 +15,21 @@ qu'un utilisateur se plaigne. Les outils qui écrivent refusent d'agir tant que
 `INFOMANIAK_WRITE=1` n'est pas posé — et le refus arrive *avant* l'appel
 réseau, pas après.
 
-**Aucun outil n'achète.** `POST /2/domains/accounts/{account}/create` et
-`/transfer` engagent de l'argent. Ils ne sont pas exposés. Un agent doit
-pouvoir dire « ce domaine est libre, il coûte 14,90 € », jamais le commander :
-la commande se passe dans le manager, à la main, par quelqu'un qui voit le
-montant. Un test vérifie qu'aucun appel du code ne vise ces chemins.
+**Dépenser n'est pas écrire.** Enregistrer un domaine engage de l'argent et ne
+se défait pas. C'est donc un geste d'une autre classe, avec quatre barrières
+indépendantes : un armement propre (`INFOMANIAK_ACHAT=1`, distinct de
+`INFOMANIAK_WRITE`), un plafond en euros appliqué au total période comprise, un
+montant **obligatoire et jamais deviné** — c'est ce qui donne sa valeur au
+contrôle `invalid_expected_amount` de l'API — et une confirmation qui répète le
+nom du domaine. Le transfert n'est pas exposé, et un test le vérifie sur l'AST.
+
+**`INFOMANIAK_ACCOUNT` est une frontière, pas un défaut.** Un jeton voit souvent
+plusieurs comptes. Épinglé, le serveur ne touche plus rien d'autre : l'argument
+`account` ne peut que répéter l'épinglage, la liste des domaines est bornée à ce
+compte, et **tout domaine ou zone nommé est vérifié comme lui appartenant**.
+C'est ce dernier point qui compte : les zones DNS sont adressées par nom et non
+par compte, donc sans ce contrôle, épingler ne protégerait que la moitié des
+chemins — et pas celle par laquelle on casse le site d'un client.
 
 ## Installation
 
@@ -97,7 +107,9 @@ poignée de main s'il peut écrire ou non.
 | `INFOMANIAK_TOKEN` | le jeton, en clair |
 | `INFOMANIAK_TOKEN_CMD` | une commande qui l'imprime — à préférer |
 | `INFOMANIAK_WRITE` | `1` arme les outils qui écrivent ; absent, lecture seule |
-| `INFOMANIAK_ACCOUNT` | l'identifiant de compte ; sinon résolu au premier besoin |
+| `INFOMANIAK_ACHAT` | `1` arme l'enregistrement de domaine ; distinct du précédent |
+| `INFOMANIAK_ACHAT_MAX` | plafond en € HT, 50 par défaut ; illisible ⇒ refus |
+| `INFOMANIAK_ACCOUNT` | **borne** le serveur à ce compte ; sinon résolu, et refusé s'il y en a plusieurs |
 | `INFOMANIAK_BASE` | l'URL de l'API (pour les tests) |
 | `INFOMANIAK_RATE` | le plafond par minute, 60 par défaut |
 
@@ -115,6 +127,7 @@ poignée de main s'il peut écrire ou non.
 | `enregistrements` | les enregistrements d'une zone, filtrables par type ou source |
 | `verifie_enregistrement` | l'enregistrement est-il *servi* par les serveurs de noms |
 | `dnssec` | l'état DNSSEC d'un domaine |
+| `contacts` | les contacts du compte, pour renseigner une commande |
 
 `verifie_enregistrement` mérite un mot : « écrit dans la zone » et « servi au
 réseau » ne sont pas la même chose, et c'est exactement l'écart qui fait perdre
@@ -129,13 +142,23 @@ une demi-heure quand un certificat ne se renouvelle pas.
 | `supprime_enregistrement` | supprime un enregistrement |
 | `serveurs_de_noms` | remplace les serveurs de noms — au moins deux, jamais un |
 
+### Dépense — armée par `INFOMANIAK_ACHAT=1`
+
+| Outil | Ce qu'il fait |
+|---|---|
+| `commande_domaine` | enregistre un domaine ; exige montant lu, confirmation, et reste sous plafond |
+
+Sur une coupure réseau, cet outil ne rend pas une erreur ordinaire : il annonce
+une **issue indéterminée** et interdit le rejeu. Un délai dépassé ne prouve pas
+que la commande n'est pas passée, et rejouer paierait deux fois.
+
 ## Les tests
 
 ```bash
 ./tests/run.sh
 ```
 
-164 vérifications, sans réseau et sans jeton : une fausse API Infomaniak est
+269 vérifications, sans réseau et sans jeton : une fausse API Infomaniak est
 servie en local, et elle **enregistre chaque requête reçue**. C'est le point
 important — quand un test vérifie qu'un garde-fou a bloqué une écriture, il
 constate qu'aucune requête n'est partie, pas seulement qu'un message d'erreur

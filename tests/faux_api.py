@@ -30,8 +30,13 @@ def remise_a_zero():
         ETAT.update({
             "comptes": [{"id": 4242, "name": "Compte de test"}],
             "domaines": [
-                {"id": 1, "customer_name": "exemple.ch", "expired_at": 1800000000},
-                {"id": 2, "customer_name": "exemple.fr", "expired_at": 1800000000},
+                # `account_id` doit être là : sans lui, un serveur épinglé sur
+                # le compte 4242 ne reconnaîtrait aucun de ces domaines comme
+                # sien, et la fausse API mentirait sur la forme du réel.
+                {"id": 1, "customer_name": "exemple.ch", "expired_at": 1800000000,
+                 "account_id": 4242},
+                {"id": 2, "customer_name": "exemple.fr", "expired_at": 1800000000,
+                 "account_id": 4242},
             ],
             "zones": {"exemple.ch": [{"id": 9, "fqdn": "exemple.ch"}]},
             "enregistrements": {
@@ -138,6 +143,10 @@ class Poignee(BaseHTTPRequestHandler):
         # /2/domains/domains
         if seg == ["2", "domains", "domains"] and methode == "GET":
             liste = ETAT["domaines"]
+            compte = (params.get("account_id") or [""])[0]
+            if compte:
+                liste = [d for d in liste
+                         if str(d.get("account_id") or "") == str(compte)]
             cherche = (params.get("search") or [""])[0]
             if cherche:
                 liste = [d for d in liste if cherche in d["customer_name"]]

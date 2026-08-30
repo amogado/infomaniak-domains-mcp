@@ -13,23 +13,35 @@ Configuration, par variables d'environnement :
                              bw get password infomaniak-api --session "$BW_SESSION"
     INFOMANIAK_WRITE       « 1 » pour armer les outils qui écrivent. Absent,
                            le serveur est en lecture seule et le dit.
-    INFOMANIAK_ACCOUNT     l'identifiant de compte à utiliser par défaut ;
-                           sinon il est résolu au premier appel qui en a besoin.
+    INFOMANIAK_ACHAT       « 1 » pour armer l'enregistrement de domaine.
+                           Distinct de INFOMANIAK_WRITE, exprès.
+    INFOMANIAK_ACHAT_MAX   plafond en euros HT, 50 par défaut. Une valeur
+                           illisible refuse au lieu de retomber sur le défaut.
+    INFOMANIAK_ACCOUNT     le compte auquel ce serveur est **borné**. Voir plus
+                           bas : c'est une frontière, pas un défaut.
 
 Le jeton n'est jamais journalisé ni renvoyé dans une réponse d'outil.
 
-Deux choix structurants, tenus exprès :
+Trois choix structurants, tenus exprès :
 
 1. **Lecture seule par défaut.** Le DNS est un système vivant et visible de
    l'extérieur : un enregistrement de travers retire un site du réseau, et
    personne ne l'apprend avant que quelqu'un se plaigne. Écrire demande donc un
    armement explicite, pas un oubli de configuration.
 
-2. **Aucun outil n'achète.** `POST /2/domains/accounts/{account}/create` et
-   `/transfer` engagent de l'argent. Ils ne sont pas exposés, à dessein : un
-   agent doit pouvoir dire « ce domaine est libre, il coûte tant », jamais le
-   commander. La commande se passe dans le manager, à la main, par un humain
-   qui voit le montant.
+2. **Dépenser est d'une autre nature qu'écrire.** Enregistrer un domaine a son
+   propre armement, son propre plafond, et exige un montant que l'appelant a lu
+   lui-même — jamais deviné par le serveur, sans quoi le contrôle
+   `invalid_expected_amount` de l'API ne vaudrait rien. Le transfert, lui,
+   n'est pas exposé du tout.
+
+3. **`INFOMANIAK_ACCOUNT` est une frontière.** Un jeton voit souvent plusieurs
+   comptes — les siens et ceux de ses clients. Épinglé, le serveur ne touche
+   plus rien d'autre : l'argument `account` ne peut que répéter l'épinglage,
+   jamais le franchir, et **tout domaine ou zone nommé est vérifié comme
+   appartenant au compte**. Ce dernier point est le seul qui compte vraiment :
+   les zones DNS sont adressées par nom, pas par compte, et c'est par là qu'on
+   casserait le site de quelqu'un d'autre.
 """
 
 import json
@@ -196,15 +208,82 @@ def appel(chemin, params=None, corps=None, methode=None, _ouvre=None):
 _COMPTE = {"valeur": None}
 
 
+_DOMAINES_DU_COMPTE = {}
+
+
+def compte_epingle():
+    """Le compte auquel ce serveur est borné, ou None.
+
+    `INFOMANIAK_ACCOUNT` n'est pas un défaut commode : c'est une **frontière**.
+    Un jeton Infomaniak voit souvent plusieurs comptes — les siens et ceux de
+    ses clients — et rien dans l'API ne rappelle lequel on visait. Épingler le
+    compte fait de cette confusion une impossibilité plutôt qu'une vigilance.
+    """
+    return os.environ.get("INFOMANIAK_ACCOUNT", "").strip() or None
+
+
+def domaines_du_compte():
+    """Les noms de domaine du compte épinglé, retenus après la première lecture.
+
+    Sert au contrôle d'appartenance. Sans lui, l'épinglage ne protégerait que
+    les chemins qui portent un identifiant de compte — or les zones DNS sont
+    adressées **par nom**, et c'est par là qu'on casse vraiment quelque chose.
+    """
+    epingle = compte_epingle()
+    if not epingle:
+        return None
+    if epingle in _DOMAINES_DU_COMPTE:
+        return _DOMAINES_DU_COMPTE[epingle]
+    noms, page = [], 1
+    while page <= 20:
+        lot = appel("/2/domains/domains",
+                    params={"account_id": epingle, "per_page": 100, "page": page}) or []
+        noms += [d.get("customer_name") or d.get("name") for d in lot]
+        if len(lot) < 100:
+            break
+        page += 1
+    _DOMAINES_DU_COMPTE[epingle] = [n for n in noms if n]
+    return _DOMAINES_DU_COMPTE[epingle]
+
+
+def exige_appartenance(cible, quoi="ce nom"):
+    """Refuse un domaine ou une zone qui ne relève pas du compte épinglé.
+
+    La comparaison porte sur le **suffixe de domaine**, pas sur la chaîne :
+    `interne.exemple.fr` relève de `exemple.fr`, mais `pasexemple.fr` non — et
+    un test le vérifie, parce que c'est exactement le genre de garde qu'on
+    écrit par mégarde avec un `endswith` nu.
+    """
+    epingle = compte_epingle()
+    if not epingle:
+        return
+    nom = (cible or "").strip().lower().rstrip(".")
+    for domaine in domaines_du_compte() or []:
+        propre = str(domaine).strip().lower().rstrip(".")
+        if propre and (nom == propre or nom.endswith("." + propre)):
+            return
+    raise ErreurInfomaniak(
+        "%s (%r) ne relève pas du compte épinglé %s. Ce serveur est borné à ce "
+        "compte par INFOMANIAK_ACCOUNT et ne touchera rien d'autre — ni en "
+        "lecture, ni en écriture." % (quoi, cible, epingle))
+
+
 def compte_par_defaut(donne=None):
     """L'identifiant de compte à employer. Certains chemins l'exigent — le
     contrôle de disponibilité, notamment, qui est indexé par compte parce que
     le prix dépend du contrat."""
+    epingle = compte_epingle()
+    if epingle:
+        # L'argument ne franchit pas la frontière : il ne peut que la répéter.
+        if donne and str(donne).strip() != epingle:
+            raise ErreurInfomaniak(
+                "compte %r demandé alors que ce serveur est épinglé sur %s. "
+                "L'argument account ne peut pas franchir cette frontière ; pour "
+                "viser un autre compte, il faut changer INFOMANIAK_ACCOUNT."
+                % (str(donne).strip(), epingle))
+        return epingle
     if donne:
         return donne
-    fixe = os.environ.get("INFOMANIAK_ACCOUNT", "").strip()
-    if fixe:
-        return fixe
     if _COMPTE["valeur"]:
         return _COMPTE["valeur"]
     comptes = appel("/1/accounts") or []
@@ -312,7 +391,7 @@ def outil_comptes(args):
 def outil_domaines(args):
     """Les domaines du compte. `search` filtre, `tld` restreint à une extension."""
     params = {
-        "account_id": args.get("account"),
+        "account_id": args.get("account") or compte_epingle(),
         "search": args.get("search"),
         "tld": args.get("tld"),
         "page": args.get("page"),
@@ -327,6 +406,7 @@ def outil_domaine(args):
     nom = (args.get("domain") or "").strip()
     if not nom:
         raise ErreurInfomaniak("il faut un domaine dans domain.")
+    exige_appartenance(nom, "ce domaine")
     return appel("/2/domains/domains/" + urllib.parse.quote(nom, safe=""))
 
 
@@ -391,6 +471,7 @@ def outil_zones(args):
     nom = (args.get("domain") or "").strip()
     if not nom:
         raise ErreurInfomaniak("il faut un domaine dans domain.")
+    exige_appartenance(nom, "ce domaine")
     zones = appel("/2/domains/domains/%s/zones" % urllib.parse.quote(nom, safe="")) or []
     return {"zones": zones, "nombre": len(zones)}
 
@@ -400,6 +481,7 @@ def outil_enregistrements(args):
     zone = (args.get("zone") or "").strip()
     if not zone:
         raise ErreurInfomaniak("il faut une zone dans zone (le fqdn, par exemple « exemple.ch »).")
+    exige_appartenance(zone, "cette zone")
     params = {"with": "records_description", "per_page": args.get("per_page") or 500,
               "page": args.get("page"), "search": args.get("search")}
     liste = appel("/2/zones/%s/records" % urllib.parse.quote(zone, safe=""),
@@ -420,6 +502,7 @@ def outil_verifie_enregistrement(args):
     identifiant = args.get("record")
     if not zone or identifiant in (None, ""):
         raise ErreurInfomaniak("il faut zone et record (l'identifiant numérique).")
+    exige_appartenance(zone, "cette zone")
     return appel("/2/zones/%s/records/%s/check"
                  % (urllib.parse.quote(zone, safe=""),
                     urllib.parse.quote(str(identifiant), safe="")))
@@ -430,6 +513,7 @@ def outil_dnssec(args):
     nom = (args.get("domain") or "").strip()
     if not nom:
         raise ErreurInfomaniak("il faut un domaine dans domain.")
+    exige_appartenance(nom, "ce domaine")
     return appel("/2/domains/domains/%s/dnssec/check" % urllib.parse.quote(nom, safe=""))
 
 
@@ -464,6 +548,7 @@ def outil_ajoute_enregistrement(args):
         raise ErreurInfomaniak("il faut une cible dans target.")
     ttl = _ttl(args.get("ttl"))
     exige_ecriture("créer un %s dans %s" % (type_, zone))
+    exige_appartenance(zone, "cette zone")
     corps = {"type": type_, "target": str(cible), "ttl": ttl}
     source = args.get("source")
     if source is not None:
@@ -488,6 +573,7 @@ def outil_modifie_enregistrement(args):
     if not corps:
         raise ErreurInfomaniak("rien à modifier : donner target, ttl, ou les deux.")
     exige_ecriture("modifier l'enregistrement %s de %s" % (identifiant, zone))
+    exige_appartenance(zone, "cette zone")
     modifie = appel("/2/zones/%s/records/%s"
                     % (urllib.parse.quote(zone, safe=""),
                        urllib.parse.quote(str(identifiant), safe="")),
@@ -502,6 +588,7 @@ def outil_supprime_enregistrement(args):
     if not zone or identifiant in (None, ""):
         raise ErreurInfomaniak("il faut zone et record (l'identifiant numérique).")
     exige_ecriture("supprimer l'enregistrement %s de %s" % (identifiant, zone))
+    exige_appartenance(zone, "cette zone")
     appel("/2/zones/%s/records/%s"
           % (urllib.parse.quote(zone, safe=""),
              urllib.parse.quote(str(identifiant), safe="")),
@@ -612,6 +699,9 @@ def outil_commande_domaine(args):
                 "désormais au compte %s." % (nom, err, compte))
         raise
 
+    # Le domaine vient d'entrer dans le compte : la liste d'appartenance
+    # retenue ne le connaît pas encore, et le refuserait au geste suivant.
+    _DOMAINES_DU_COMPTE.pop(str(compte), None)
     return {"domaine": nom, "montant_ht": montant, "annees": periode,
             "compte": str(compte), "reponse": data}
 
@@ -630,6 +720,7 @@ def outil_serveurs_de_noms(args):
             "il faut au moins deux serveurs de noms : avec un seul, la moindre "
             "panne rend le domaine introuvable.")
     exige_ecriture("remplacer les serveurs de noms de %s" % nom)
+    exige_appartenance(nom, "ce domaine")
     return appel("/2/domains/domains/%s/nameservers" % urllib.parse.quote(nom, safe=""),
                  corps={"nameservers": [str(s) for s in serveurs]}, methode="PUT")
 
