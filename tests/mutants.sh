@@ -117,9 +117,9 @@ mutant "le compte est re-résolu à chaque appel" \
   $'    if _COMPTE["valeur"]:\n        return _COMPTE["valeur"]' \
   $'    if False:\n        return _COMPTE["valeur"]'
 
-mutant "un compte fixé par l'environnement est ignoré" \
-  '    fixe = os.environ.get("INFOMANIAK_ACCOUNT", "").strip()' \
-  '    fixe = ""'
+mutant "l'epinglage n'est plus employe comme compte" \
+  $'        return epingle\n    if donne:' \
+  $'        pass\n    if donne:'
 
 mutant "l'absence de jeton n'arrête plus rien" \
   $'    if not cle:\n        raise ErreurInfomaniak(' \
@@ -224,6 +224,42 @@ mutant "une coupure réseau n'avertit plus du rejeu" \
 mutant "toute erreur devient une issue indéterminée" \
   '        if "injoignable" in str(err):' \
   '        if True:'
+
+# --- la frontiere du compte epingle -----------------------------------------
+# Celles-ci protegent le compte d'autrui. Un survivant ici, c'est la zone DNS
+# d'un client qu'on peut atteindre.
+
+mutant "l'argument account franchit l'epinglage" \
+  '        if donne and str(donne).strip() != epingle:' \
+  '        if False:'
+
+mutant "l'appartenance ne verifie plus rien" \
+  $'    if not epingle:\n        return\n    nom = (cible' \
+  $'    if True:\n        return\n    nom = (cible'
+
+mutant "l'appartenance se contente d'un suffixe de chaine" \
+  '        if propre and (nom == propre or nom.endswith("." + propre)):' \
+  '        if propre and nom.endswith(propre):'
+
+mutant "l'appartenance accepte tout ce qui contient le nom" \
+  '        if propre and (nom == propre or nom.endswith("." + propre)):' \
+  '        if propre and propre in nom:'
+
+mutant "la liste des domaines n'est plus bornee au compte" \
+  '        "account_id": args.get("account") or compte_epingle(),' \
+  '        "account_id": args.get("account"),'
+
+mutant "l'epinglage ne normalise plus les espaces" \
+  '    return os.environ.get("INFOMANIAK_ACCOUNT", "").strip() or None' \
+  '    return os.environ.get("INFOMANIAK_ACCOUNT", "") or None'
+
+mutant "la liste d'appartenance n'est jamais retenue" \
+  '    if epingle in _DOMAINES_DU_COMPTE:' \
+  '    if False:'
+
+mutant "une commande ne perime plus la liste d'appartenance" \
+  '    _DOMAINES_DU_COMPTE.pop(str(compte), None)' \
+  '    pass'
 
 echo
 echo "$teste mutants, $survivants survivant(s)"

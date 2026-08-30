@@ -177,6 +177,19 @@ r = ik.outil_commande_domaine(
      "amount_total_excl_tax": 6.0})
 egal(r["compte"], "607373", "sans argument, la commande va sur le compte épinglé")
 
+# ------------------------- une variable vide ou blanche n'épingle rien
+# Le piège : sans normalisation, « INFOMANIAK_ACCOUNT="   " » épinglerait le
+# serveur sur un compte dont l'identifiant est fait d'espaces. Tous les appels
+# partiraient vers un chemin absurde, et le message d'erreur parlerait d'un
+# compte invisible à l'œil nu.
+for blanc in ("", "   ", "\t", "\n  "):
+    os.environ["INFOMANIAK_ACCOUNT"] = blanc
+    ok(ik.compte_epingle() is None,
+       "une valeur blanche %r n'épingle rien" % blanc)
+os.environ["INFOMANIAK_ACCOUNT"] = "  607373  "
+egal(ik.compte_epingle(), "607373",
+     "les espaces autour d'un identifiant réel sont retirés")
+
 # ------------------------- sans épinglage, le comportement d'avant est intact
 faux_api.remise_a_zero()
 ik._COMPTE["valeur"] = None
