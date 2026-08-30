@@ -115,7 +115,7 @@ une demi-heure quand un certificat ne se renouvelle pas.
 ./tests/run.sh
 ```
 
-158 vérifications, sans réseau et sans jeton : une fausse API Infomaniak est
+164 vérifications, sans réseau et sans jeton : une fausse API Infomaniak est
 servie en local, et elle **enregistre chaque requête reçue**. C'est le point
 important — quand un test vérifie qu'un garde-fou a bloqué une écriture, il
 constate qu'aucune requête n'est partie, pas seulement qu'un message d'erreur

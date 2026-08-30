@@ -6,7 +6,7 @@ zones DNS d'un compte Infomaniak. Un seul fichier : `infomaniak_mcp.py`.
 
 ## Rendre rouge / vert
 ```bash
-./tests/run.sh          # 158 vérifications, sans réseau ni jeton
+./tests/run.sh          # 164 vérifications, sans réseau ni jeton
 ```
 La fausse API vit dans `tests/faux_api.py`. Elle **enregistre chaque requête**
 (`faux_api.requetes()`) : c'est l'instrument qui permet de prouver qu'un geste
