@@ -55,6 +55,13 @@ def remise_a_zero():
             "force_code": None,
             "force_corps": None,
             "commandes": [],
+            "total_menteur": None,
+            "operations": [
+                {"id": "po-1", "amount": 50.0, "currency": "EUR",
+                 "status": "payed", "created_at": 1788122771},
+                {"id": "po-2", "amount": -14.5, "currency": "EUR",
+                 "status": "payed", "created_at": 1788123487},
+            ],
         })
 
 
@@ -174,6 +181,29 @@ class Poignee(BaseHTTPRequestHandler):
         if len(seg) == 5 and seg[4] == "nameservers" and methode == "PUT":
             noms = (corps or {}).get("nameservers") or []
             return self._succes({"domain": seg[3], "nameservers": noms})
+
+        # /1/invoicing/{account}/payment/prepay/history — le grand livre
+        # Reproduit fidèlement les défauts constatés le 2026-08-30 : `pages`
+        # est incohérent, et `page` est ignoré quand per_page est grand — la
+        # même page revient indéfiniment. Une lecture naïve boucle et compte
+        # double.
+        if (len(seg) == 6 and seg[0] == "1" and seg[1] == "invoicing"
+                and seg[3] == "payment" and seg[4] == "prepay" and seg[5] == "history"):
+            ops = ETAT.get("operations", [])
+            par_page = int((params.get("per_page") or ["100"])[0])
+            page = int((params.get("page") or ["1"])[0])
+            if par_page >= 100:
+                lot = ops                      # `page` ignoré : toujours tout
+            else:
+                debut = (page - 1) * par_page
+                lot = ops[debut:debut + par_page]
+            # `total_menteur` : l'API annonce plus d'opérations qu'elle n'en
+            # rend. C'est le cas qui doit faire refuser tout calcul de solde.
+            corps_rendu = {"result": "success", "data": lot,
+                           "total": ETAT.get("total_menteur") or len(ops),
+                           "pages": max(1, len(ops) // max(1, par_page) + 1),
+                           "items_per_page": par_page, "page": page}
+            return self._rend(200, corps_rendu)
 
         # /2/domains/accounts/{account}/create  — l'enregistrement
         if len(seg) == 5 and seg[:3] == ["2", "domains", "accounts"] and seg[4] == "create":

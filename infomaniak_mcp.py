@@ -119,7 +119,8 @@ class Cadence:
 CADENCE = Cadence(PLAFOND, FENETRE)
 
 
-def appel(chemin, params=None, corps=None, methode=None, _ouvre=None):
+def appel(chemin, params=None, corps=None, methode=None, _ouvre=None,
+          enveloppe_entiere=False):
     """Un appel à l'API. Rend le contenu de `data`, ou lève ErreurInfomaniak
     avec une raison lisible — jamais une trace de pile dans le fil."""
     cle = jeton()
@@ -229,6 +230,8 @@ def appel(chemin, params=None, corps=None, methode=None, _ouvre=None):
                 % (raison or "sans détail", PLAFOND))
         raise ErreurInfomaniak("l'API a répondu %d : %s" % (code, raison or "sans détail"))
 
+    if enveloppe_entiere:
+        return enveloppe
     return enveloppe.get("data")
 
 
@@ -643,6 +646,90 @@ def outil_contacts(args):
     return {"contacts": liste, "nombre": len(liste)}
 
 
+def outil_solde(args):
+    """Le solde du compte prépayé, déduit du grand livre des opérations.
+
+    Infomaniak n'expose pas le solde : `/1/invoicing/{compte}/payment/prepay`
+    répond « method_not_yet_implemented ». Seul l'historique est lisible.
+
+    Et sa pagination est défectueuse — constaté le 2026-08-30 : `pages` annonce
+    un nombre incohérent, et `page` est ignoré au-delà d'une certaine taille, si
+    bien que la même page revient indéfiniment. Une lecture naïve boucle et
+    compte deux fois.
+
+    D'où la conduite tenue ici : on **dédoublonne par identifiant**, et on ne
+    rend un solde que si le nombre d'opérations distinctes égale le `total`
+    annoncé par l'API. Sinon, aucun chiffre — un solde faux est pire qu'un
+    solde absent, parce qu'on décide dessus.
+    """
+    compte = compte_par_defaut(args.get("account"))
+    chemin = ("/1/invoicing/%s/payment/prepay/history"
+              % urllib.parse.quote(str(compte), safe=""))
+
+    vues, total_annonce = {}, None
+    par_page = 500
+    page, sans_neuf = 1, 0
+    while page <= 40:
+        env = appel(chemin, params={"per_page": par_page, "page": page},
+                    enveloppe_entiere=True) or {}
+        lot = env.get("data") or []
+        if env.get("total") is not None:
+            total_annonce = env["total"]
+        avant = len(vues)
+        for o in lot:
+            if isinstance(o, dict) and o.get("id") is not None:
+                vues[str(o["id"])] = o
+        # Rien de neuf : soit on a tout, soit la pagination tourne en rond.
+        # Dans les deux cas, insister ne sert à rien.
+        if len(vues) == avant:
+            sans_neuf += 1
+            if sans_neuf >= 2:
+                break
+        else:
+            sans_neuf = 0
+        if total_annonce is not None and len(vues) >= total_annonce:
+            break
+        if not lot:
+            break
+        page += 1
+
+    ops = list(vues.values())
+    if total_annonce is not None and len(ops) != total_annonce:
+        raise ErreurInfomaniak(
+            "grand livre incomplet : l'API annonce %s opérations et n'en a "
+            "rendu que %d de distinctes. Aucun solde n'est rendu — un solde "
+            "calculé sur un livre partiel serait faux, et on déciderait "
+            "dessus. La pagination de cet endpoint est connue pour être "
+            "défectueuse." % (total_annonce, len(ops)))
+
+    payees = [o for o in ops if str(o.get("status", "")).lower() in ("payed", "paid")]
+    en_attente = len(ops) - len(payees)
+
+    par_devise = {}
+    for o in payees:
+        d = o.get("currency") or "?"
+        par_devise[d] = round(par_devise.get(d, 0.0) + float(o.get("amount") or 0), 2)
+
+    resultat = {"compte": str(compte), "operations": len(ops),
+                "complet": True, "par_devise": par_devise}
+    if en_attente:
+        resultat["en_attente"] = en_attente
+    if len(par_devise) == 1:
+        devise, montant = next(iter(par_devise.items()))
+        resultat["solde"] = montant
+        resultat["devise"] = devise
+        resultat["credite"] = round(sum(float(o.get("amount") or 0) for o in payees
+                                        if (o.get("amount") or 0) > 0), 2)
+        resultat["depense"] = round(sum(float(o.get("amount") or 0) for o in payees
+                                        if (o.get("amount") or 0) < 0), 2)
+    if payees:
+        dernier = max(payees, key=lambda o: o.get("created_at") or 0)
+        resultat["derniere_operation"] = {"id": dernier.get("id"),
+                                          "montant": dernier.get("amount"),
+                                          "quand": dernier.get("created_at")}
+    return resultat
+
+
 def outil_commande_domaine(args):
     """Enregistrer un domaine. Engage une dépense, et ne se défait pas.
 
@@ -856,6 +943,13 @@ TOOLS = [
        "Les contacts du compte : propriétaire, administratif, technique, "
        "facturation. Leurs identifiants servent à renseigner une commande.",
        {"account": S}, [], outil_contacts),
+
+    _o("solde",
+       "Le solde du compte prépayé, d'où sont payées les commandes de domaine. "
+       "Déduit du grand livre : si celui-ci ne peut pas être lu en entier, "
+       "aucun chiffre n'est rendu plutôt qu'un chiffre faux. Créditer le "
+       "compte se fait sur " + CREDITER + ".",
+       {"account": S}, [], outil_solde),
 
     _o("commande_domaine",
        "Enregistrer un domaine. Engage une dépense qui ne se défait pas. Exige "
