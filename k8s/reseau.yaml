@@ -1,0 +1,50 @@
+# ⚠️ CE MANIFESTE N'EST PAS APPLIQUÉ — il coupe Traefik. Voir la dette D13.
+#
+# Mesuré le 2026-08-31, deux fois : avec cette policy, les chemins machine
+# rendent 502 ; sans elle, 200 et 401. Pourtant le pod porte bien
+# `app: infomaniak-domains`, `kube-system` porte bien
+# `kubernetes.io/metadata.name`, et Traefik n'est pas en hostNetwork
+# (adresses de pod 10.42.0.246 et 10.42.1.169). Ajouter un ipBlock sur le
+# réseau des nœuds (10.0.0.0/16) n'a rien changé non plus.
+#
+# La cause n'est donc pas établie, et on ne déploie pas un garde-fou dont
+# on ne comprend pas le comportement : il couperait le service en croyant
+# le protéger.
+#
+# Le pod n'accepte de trafic que de l'ingress, jamais d'un voisin du cluster.
+#
+# Sans elle, `_humain_present()` — le filet qui garde la page émettant les codes
+# d'autorisation — se contourne en joignant le pod sur 8080 en direct, sans
+# passer par Traefik ni son Basic Auth. C'est exactement le scénario nommé par
+# l'audit adverse du 2026-08-31 (dette D1). Corriger `_humain_present` reste à
+# faire ; cette policy retire d'abord le chemin qui rend la faille atteignable.
+#
+# La règle est fail-closed par construction : un Ingress vide interdirait tout,
+# et ce qui n'est pas nommé ici n'entre pas.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: infomaniak-domains-entree
+spec:
+  podSelector:
+    matchLabels:
+      app: infomaniak-domains
+  policyTypes: ["Ingress"]
+  ingress:
+    # Traefik, quel que soit le namespace où la plateforme le range : on vise
+    # par étiquette, pas par nom d'espace, qui n'est pas garanti.
+    - from:
+        # Par namespace, quand le CNI voit l'adresse du pod source.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+        # Et par adresse de nœud : mesuré le 2026-08-31, le trafic de Traefik
+        # arrive ici masqué derrière l'IP du nœud, donc le sélecteur de
+        # namespace seul ne le reconnaît pas et rend un 502. Le réseau des pods
+        # (10.42.0.0/16) reste hors de cette plage : les autres tenants sont
+        # toujours tenus dehors, ce qui est tout l'objet de cette policy.
+        - ipBlock:
+            cidr: 10.0.0.0/16
+      ports:
+        - port: 8080
+          protocol: TCP

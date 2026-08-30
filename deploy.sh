@@ -82,6 +82,9 @@ $K create configmap infomaniak-domains-app \
 
 echo "==> Manifests"
 $K apply -f "$HERE/k8s/networking.yaml"
+# k8s/reseau.yaml n'est PAS appliqué : en l'état il coupe Traefik (502).
+# Voir la dette D13 — le fichier reste au dépôt avec ce qui a été mesuré,
+# parce qu'un manifeste retiré emporte le diagnostic avec lui.
 $K apply -f "$HERE/k8s/deployment.yaml"
 
 echo "==> Rollout"
