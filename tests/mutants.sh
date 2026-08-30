@@ -28,17 +28,33 @@ trap restaure EXIT INT TERM
 survivants=0
 teste=0
 
+# mutant <nom> <avant> <apres> [occurrence]
+# Sans occurrence, le motif doit être unique — un motif ambigu est une erreur,
+# pas une invitation à muter au hasard. Avec, on vise la Nième, ce qui sert
+# quand la même garde existe dans deux fonctions.
 mutant() {
-  local nom="$1" avant="$2" apres="$3"
+  local nom="$1" avant="$2" apres="$3" rang="${4:-0}"
   teste=$(( teste + 1 ))
   restaure
-  python3 - "$CIBLE" "$avant" "$apres" <<'PY' || { echo "  ?? $nom : motif introuvable"; survivants=$(( survivants + 1 )); return; }
+  python3 - "$CIBLE" "$avant" "$apres" "$rang" <<'PY' || { echo "  ?? $nom : motif introuvable"; survivants=$(( survivants + 1 )); return; }
 import sys, pathlib
-fichier, avant, apres = sys.argv[1], sys.argv[2], sys.argv[3]
+fichier, avant, apres, rang = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 p = pathlib.Path(fichier); s = p.read_text(encoding="utf-8")
-if s.count(avant) != 1:
-    sys.exit("le motif apparaît %d fois" % s.count(avant))
-p.write_text(s.replace(avant, apres), encoding="utf-8")
+combien = s.count(avant)
+if combien == 0:
+    sys.exit("le motif est absent")
+if rang == 0:
+    if combien != 1:
+        sys.exit("le motif apparait %d fois : preciser l'occurrence" % combien)
+    p.write_text(s.replace(avant, apres), encoding="utf-8")
+    raise SystemExit(0)
+if rang > combien:
+    sys.exit("occurrence %d demandee, %d presente(s)" % (rang, combien))
+# on coupe juste avant la Nième occurrence, on remplace la première d'après
+pos = -1
+for _ in range(rang):
+    pos = s.index(avant, pos + 1)
+p.write_text(s[:pos] + apres + s[pos + len(avant):], encoding="utf-8")
 PY
   # macOS n'a pas `timeout`. Une limite est indispensable : un mutant peut
   # faire boucler ou dormir la suite, et l'attente serait alors confondue avec
@@ -117,13 +133,21 @@ mutant "la fenêtre de cadence cesse de glisser" \
   $'            self.appels = [a for a in self.appels if t - a < self.fenetre]\n            if len' \
   $'            self.appels = list(self.appels)\n            if len'
 
-mutant "le nom de domaine n'est plus normalisé" \
+mutant "le nom n'est plus normalise (disponibilite)" \
   'nom = (args.get("domain") or "").strip().lower()' \
-  'nom = args.get("domain") or ""'
+  'nom = args.get("domain") or ""' 1
 
-mutant "un nom sans extension part quand même sur le réseau" \
+mutant "le nom n'est plus normalise (commande)" \
+  'nom = (args.get("domain") or "").strip().lower()' \
+  'nom = args.get("domain") or ""' 2
+
+mutant "un nom sans extension part sur le reseau (disponibilite)" \
   '    if "." not in nom:' \
-  '    if False:'
+  '    if False:' 1
+
+mutant "un nom sans extension part sur le reseau (commande)" \
+  '    if "." not in nom:' \
+  '    if False:' 2
 
 mutant "la description des enregistrements n'est plus demandée" \
   'params = {"with": "records_description", "per_page"' \
