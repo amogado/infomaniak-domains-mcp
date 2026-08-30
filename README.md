@@ -61,9 +61,14 @@ domain:write   invoicing:prepaid:read   invoicing:order:write   invoicing:paymen
 À peser avant de les cocher : les deux dernières donnent au jeton le droit de
 passer des commandes et d'effectuer des paiements sur le compte — pas seulement
 d'acheter *ce* domaine. Un jeton porteur de `invoicing:payment:write` est une
-clé de paiement, pas une clé de DNS. Pour un achat isolé, le manager reste le
-chemin le plus sobre ; ces portées se justifient quand on veut la capacité de
-façon durable.
+clé de paiement, pas une clé de DNS.
+
+Et surtout, **la commande par l'API tire sur le crédit prépayé du compte**, pas
+sur un moyen de paiement enregistré. Solde vide, l'API répond
+`insufficient_funds_prepaid_balance` — constaté le 2026-08-30. Aucun endpoint
+public ne permet de lire ni de recharger ce solde. Pour un achat isolé, le
+manager reste donc le chemin le plus court ; ces portées et ce crédit ne se
+justifient que si l'on commande régulièrement par l'API.
 
 Le serveur ne veut pas du jeton lui-même : il veut une **commande qui
 l'imprime**, `INFOMANIAK_TOKEN_CMD`, exécutée au dernier moment. Le secret ne
