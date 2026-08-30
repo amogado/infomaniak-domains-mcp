@@ -46,9 +46,24 @@ portées minimales :
 
 | Portée | Pour quoi |
 |---|---|
+| `accounts` | résoudre l'identifiant de compte — le contrôle de disponibilité en dépend |
 | `domain:read` | lister les domaines, contrôler une disponibilité |
 | `dns:read` | lire les zones et les enregistrements |
 | `dns:write` | modifier les enregistrements — inutile si on reste en lecture |
+
+Pour **enregistrer** un domaine, l'API en exige quatre de plus, relevé sur son
+propre refus le 2026-08-30 :
+
+```
+domain:write   invoicing:prepaid:read   invoicing:order:write   invoicing:payment:write
+```
+
+À peser avant de les cocher : les deux dernières donnent au jeton le droit de
+passer des commandes et d'effectuer des paiements sur le compte — pas seulement
+d'acheter *ce* domaine. Un jeton porteur de `invoicing:payment:write` est une
+clé de paiement, pas une clé de DNS. Pour un achat isolé, le manager reste le
+chemin le plus sobre ; ces portées se justifient quand on veut la capacité de
+façon durable.
 
 Le serveur ne veut pas du jeton lui-même : il veut une **commande qui
 l'imprime**, `INFOMANIAK_TOKEN_CMD`, exécutée au dernier moment. Le secret ne
