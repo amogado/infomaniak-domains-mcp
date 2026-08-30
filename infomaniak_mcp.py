@@ -432,7 +432,13 @@ def outil_comptes(args):
 def outil_domaines(args):
     """Les domaines du compte. `search` filtre, `tld` restreint à une extension."""
     params = {
-        "account_id": args.get("account") or compte_epingle(),
+        # Passer par compte_par_defaut() et non par `or compte_epingle()` :
+        # c'est cette fonction, et elle seule, qui refuse un compte étranger
+        # quand l'épinglage est posé. La contourner ici laissait l'argument
+        # `account` franchir la frontière — trouvé par audit adverse le
+        # 2026-08-31, et bien réel.
+        "account_id": compte_par_defaut(args.get("account")) if (
+            args.get("account") or compte_epingle()) else None,
         "search": args.get("search"),
         "tld": args.get("tld"),
         "page": args.get("page"),

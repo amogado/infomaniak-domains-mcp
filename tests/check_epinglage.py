@@ -98,6 +98,38 @@ r = ik.outil_disponibilite({"domain": "x.fr", "account": "607373"})
 egal(faux_api.requetes(chemin_contient="/check")[-1]["chemin"],
      "/2/domains/accounts/607373/check", "le compte épinglé, redonné, passe")
 
+# ------------------- l'argument account ne contourne AUCUN outil, pas juste un
+# Trouvé par audit adverse le 2026-08-31, et c'était réel : `outil_domaines`
+# écrivait `args.get("account") or compte_epingle()`, court-circuitant
+# `compte_par_defaut()` — seule fonction qui tient la frontière. Le test
+# précédent n'éprouvait que `disponibilite`, donc la brèche restait verte.
+#
+# La leçon vaut au-delà du correctif : une frontière ne se teste pas sur un
+# point de passage, elle se teste sur TOUS. On énumère donc les outils qui
+# acceptent un compte, et on exige que chacun refuse.
+deux_comptes()
+for nom, args in (
+    ("domaines", {"account": "90812"}),
+    ("disponibilite", {"domain": "x.fr", "account": "90812"}),
+    ("contacts", {"account": "90812"}),
+    ("solde", {"account": "90812"}),
+):
+    outil = ik.BY_NAME[nom]["handler"]
+    leve(lambda o=outil, a=args: o(a), "épinglé",
+         "%s : un compte étranger est refusé" % nom)
+
+# Et on constate côté serveur qu'aucune requête n'a visé le compte du tiers.
+fuites = [r for r in faux_api.requetes()
+          if "90812" in r["chemin"] or ["90812"] == r["params"].get("account_id")]
+egal(fuites, [], "aucune requête n'a atteint le compte du tiers")
+
+# Assertion inverse : l'inventaire des outils à compte est-il complet ? Si un
+# outil accepte « account » dans son schéma sans figurer ci-dessus, il n'est
+# gardé par rien.
+a_compte = {t["name"] for t in ik.TOOLS if "account" in t["inputSchema"]["properties"]}
+egal(a_compte, {"domaines", "disponibilite", "contacts", "solde", "commande_domaine"},
+     "l'inventaire des outils acceptant un compte est complet")
+
 # --------------------------------------- la liste ne montre que notre compte
 deux_comptes()
 r = ik.outil_domaines({})
