@@ -171,13 +171,40 @@ class Poignee(BaseHTTPRequestHandler):
             if "." not in nom:
                 return self._echec(400, "subdomain_availability_check_fail",
                                    "ce n'est pas un domaine")
+            # Forme relevée sur la VRAIE API le 2026-08-30. La première version
+            # de cette réponse était inventée — `available`, `price` — parce
+            # que l'OpenAPI ne décrit ici que l'enveloppe générique. Le vrai dit
+            # `is_available`, range les prix sous `action.pricing`, et surtout
+            # distingue le prix de première période du prix de renouvellement,
+            # qui est le coût récurrent et vaut souvent le double.
             libre = ETAT["libres"].get(nom, True)
-            data = {"domain": nom, "available": libre}
+            data = {"domain": nom, "is_available": libre, "need_transfer": False,
+                    "status": "registration" if libre else "hosting",
+                    "is_premium": bool(ETAT.get("premium", {}).get(nom))}
             if libre:
-                data["price"] = 14.9
-                data["currency"] = "EUR"
-            if (corps or {}).get("with_option_prices"):
-                data["options"] = {"domain_privacy": 5.0}
+                premiere = ETAT.get("prix_premiere", 6.0)
+                renouv = ETAT.get("prix_renouvellement", 9.9)
+                data["action"] = {
+                    "name": "registration",
+                    "pricing": {
+                        "currency": "EUR",
+                        "registration_periods": list(range(1, 11)),
+                        "prices": {
+                            "registration": {"amount_excl_tax": premiere,
+                                             "amount_base_excl_tax": renouv},
+                            "renew": {"amount_excl_tax": renouv,
+                                      "amount_base_excl_tax": renouv},
+                            "transfer": {"amount_excl_tax": 0, "amount_base_excl_tax": 0},
+                        },
+                        "registration_period_prices": [
+                            {"period": p,
+                             "amount_excl_tax": round(premiere + (p - 1) * renouv, 2),
+                             "amount_base_excl_tax": round(p * renouv, 2)}
+                            for p in range(1, 11)],
+                    },
+                }
+                if (corps or {}).get("with_option_prices"):
+                    data["action"]["pricing"]["options"] = {"domain_privacy": 5.0}
             return self._succes(data)
 
         # /2/zones/{zone}/records  et /2/zones/{zone}/records/{id}

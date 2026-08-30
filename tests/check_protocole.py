@@ -130,7 +130,10 @@ ok(not r["result"].get("isError"), "domaines : pas d'erreur")
 egal(charge(r)["nombre"], 2, "domaines : les deux, par le protocole")
 
 r = c.appelle("disponibilite", {"domain": "kiosquier.ch"})
-egal(charge(r)["reponse"]["available"], True, "disponibilité par le protocole")
+d = charge(r)
+egal(d["libre"], True, "disponibilité par le protocole")
+egal(d["premiere_periode_ht"], 6.0, "le prix de première période traverse le protocole")
+egal(d["renouvellement_ht"], 9.9, "le prix de renouvellement aussi")
 
 # ------------------------------------------------- une erreur reste une réponse
 avant = len(faux_api.requetes())

@@ -128,18 +128,34 @@ egal(r["enabled"], False, "dnssec : l'état")
 # ---------------------------------------------------- disponibilité (le step 0)
 neuf()
 r = ik.outil_disponibilite({"domain": "kiosquier.ch"})
-egal(r["reponse"]["available"], True, "disponibilité : libre")
-egal(r["reponse"]["price"], 14.9, "disponibilité : le prix est rendu")
+egal(r["libre"], True, "disponibilité : libre")
 egal(r["domaine"], "kiosquier.ch", "disponibilité : le domaine est rappelé")
+egal(r["premium"], False, "disponibilité : le caractère premium est dit")
+egal(r["devise"], "EUR", "disponibilité : la devise")
+
+# Les deux prix côte à côte. C'est le point : le prix affiché est celui de la
+# première période, souvent promotionnel, tandis que le coût réel du domaine
+# est son renouvellement — payé chaque année ensuite. Un résumé qui ne rendrait
+# que le premier ferait comparer une promotion à un tarif plein.
+egal(r["premiere_periode_ht"], 6.0, "disponibilité : prix de première période")
+egal(r["renouvellement_ht"], 9.9, "disponibilité : prix de renouvellement")
+ok(r["premiere_periode_ht"] != r["renouvellement_ht"],
+   "les deux prix sont bien distincts dans le résumé")
+egal(r["periodes_possibles"], list(range(1, 11)), "disponibilité : périodes offertes")
+ok("reponse" in r, "le brut est conservé sous reponse")
+egal(r["reponse"]["is_available"], True, "le brut porte bien is_available")
 
 r = ik.outil_disponibilite({"domain": "  KIOSQUIER.CH  "})
 egal(r["domaine"], "kiosquier.ch", "disponibilité : le nom est normalisé")
 
 r = ik.outil_disponibilite({"domain": "exemple.ch"})
-egal(r["reponse"]["available"], False, "disponibilité : pris")
+egal(r["libre"], False, "disponibilité : pris")
+ok("premiere_periode_ht" not in r,
+   "un domaine pris n'affiche aucun prix — il n'y a rien à acheter")
 
 r = ik.outil_disponibilite({"domain": "kiosquier.ch", "with_option_prices": True})
-ok("options" in r["reponse"], "disponibilité : les options quand on les demande")
+ok("options" in r["reponse"]["action"]["pricing"],
+   "disponibilité : les options quand on les demande")
 egal(faux_api.requetes(chemin_contient="/check")[-1]["corps"]["with_option_prices"], True,
      "l'option part bien dans le corps")
 
@@ -192,7 +208,7 @@ egal(len(faux_api.requetes(chemin_contient="/check")), 0,
 r = ik.outil_disponibilite({"domain": "kiosquier.ch", "account": "607373"})
 egal(faux_api.requetes(chemin_contient="/check")[-1]["chemin"],
      "/2/domains/accounts/607373/check", "le compte choisi est employé")
-egal(r["reponse"]["available"], True, "et le contrôle aboutit")
+egal(r["libre"], True, "et le contrôle aboutit")
 
 # un compte fixé par l'environnement lève aussi l'ambiguïté
 neuf()

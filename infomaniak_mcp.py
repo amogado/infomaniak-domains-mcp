@@ -344,7 +344,46 @@ def outil_disponibilite(args):
     corps = {"domain": nom, "with_option_prices": bool(args.get("with_option_prices"))}
     data = appel("/2/domains/accounts/%s/check" % urllib.parse.quote(str(compte), safe=""),
                  corps=corps, methode="POST")
-    return {"domaine": nom, "reponse": data}
+    return resume_disponibilite(nom, data)
+
+
+def resume_disponibilite(nom, data):
+    """Dégager de la réponse ce sur quoi on décide, sans jeter le brut.
+
+    Deux chiffres, pas un. Le prix affiché partout est celui de la **première
+    période** — souvent promotionnel — tandis que le coût réel d'un domaine est
+    son **renouvellement**, payé chaque année ensuite. Les rendre côte à côte
+    est le seul moyen de ne pas comparer une promotion à un tarif plein.
+
+    Et `is_premium` mérite son propre champ : un nom premium se facture parfois
+    en centaines d'euros, sans que rien d'autre ne le signale.
+    """
+    if not isinstance(data, dict):
+        return {"domaine": nom, "reponse": data}
+
+    resume = {"domaine": nom,
+              "libre": data.get("is_available"),
+              "premium": data.get("is_premium"),
+              "statut": data.get("status")}
+
+    tarifs = ((data.get("action") or {}).get("pricing") or {})
+    prix = tarifs.get("prices") or {}
+    if tarifs.get("currency"):
+        resume["devise"] = tarifs["currency"]
+    inscription = prix.get("registration") or {}
+    renouvellement = prix.get("renew") or {}
+    if inscription.get("amount_excl_tax") is not None:
+        resume["premiere_periode_ht"] = inscription["amount_excl_tax"]
+        base = inscription.get("amount_base_excl_tax")
+        if base is not None and base != inscription["amount_excl_tax"]:
+            resume["prix_public_ht"] = base
+    if renouvellement.get("amount_excl_tax") is not None:
+        resume["renouvellement_ht"] = renouvellement["amount_excl_tax"]
+    if tarifs.get("registration_periods"):
+        resume["periodes_possibles"] = tarifs["registration_periods"]
+
+    resume["reponse"] = data
+    return resume
 
 
 def outil_zones(args):
