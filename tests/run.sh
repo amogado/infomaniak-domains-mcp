@@ -3,6 +3,12 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# La cadence est éprouvée à part, avec un `dormir` injecté. Ici on la
+# désarme : sans ça, un mutant qui casse l'élagage fait dormir la suite
+# soixante secondes par appel, et un blocage ressemble alors à un mutant
+# qui survit. Deux signaux distincts ne doivent pas se confondre.
+export INFOMANIAK_RATE=1000000
+
 total=0
 casse=0
 for check in tests/check_*.py; do

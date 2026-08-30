@@ -2,6 +2,11 @@
 # Abîme délibérément le code, une fois par mutant, et exige que la suite vire au
 # rouge. Un mutant qui survit nomme un trou dans les tests.
 #
+# ⚠️ Un SIGKILL court-circuite le trap : le mutant reste alors appliqué dans
+# l'arbre. C'est arrivé le 2026-08-30. Si une exécution est tuée de force,
+# faire `git checkout -- infomaniak_mcp.py` avant toute autre chose — et n'y
+# recourir qu'après un SIGTERM resté sans effet.
+#
 # ⚠️ La restauration se fait par `git checkout`, donc depuis l'index : ne jamais
 # lancer ce script sur un travail non commité, sous peine d'effacer le travail
 # et non le mutant. Le garde ci-dessous refuse de démarrer dans ce cas, et le
@@ -35,9 +40,23 @@ if s.count(avant) != 1:
     sys.exit("le motif apparaît %d fois" % s.count(avant))
 p.write_text(s.replace(avant, apres), encoding="utf-8")
 PY
-  if ./tests/run.sh >/dev/null 2>&1; then
+  # macOS n'a pas `timeout`. Une limite est indispensable : un mutant peut
+  # faire boucler ou dormir la suite, et l'attente serait alors confondue avec
+  # une survie.
+  python3 - <<'LIMITE' >/dev/null 2>&1
+import subprocess, sys
+try:
+    r = subprocess.run(["./tests/run.sh"], capture_output=True, timeout=120)
+    sys.exit(r.returncode)
+except subprocess.TimeoutExpired:
+    sys.exit(124)
+LIMITE
+  issue=$?
+  if [ "$issue" -eq 0 ]; then
     echo "  SURVIT  $nom"
     survivants=$(( survivants + 1 ))
+  elif [ "$issue" -eq 124 ]; then
+    echo "  tue     $nom  (par blocage : la suite ne rend plus la main)"
   else
     echo "  tue     $nom"
   fi
@@ -125,6 +144,62 @@ mutant "une modification vide part quand même" \
 mutant "les handlers fuitent dans tools/list" \
   '{k: v for k, v in t.items() if k != "handler"}' \
   'dict(t)'
+
+# --- les barrières de la commande ------------------------------------------
+# Ce sont celles qui coûtent de l'argent quand elles cèdent. Chacune doit
+# mourir seule : un mutant qui survit ici est une dépense qui passe.
+
+mutant "l'armement de dépense ne garde plus rien" \
+  '    if not achat_arme():' \
+  '    if False:'
+
+mutant "INFOMANIAK_WRITE arme aussi la dépense" \
+  'return os.environ.get("INFOMANIAK_ACHAT", "").strip() in ("1", "oui", "yes", "true")' \
+  'return ecriture_armee() or os.environ.get("INFOMANIAK_ACHAT", "").strip() == "1"'
+
+mutant "le plafond ignore la période" \
+  '    total = montant * periode' \
+  '    total = montant'
+
+mutant "le plafond laisse passer l'égalité stricte en trop" \
+  '    if total > plafond:' \
+  '    if total > plafond * 2:'
+
+mutant "un plafond illisible retombe sur le défaut au lieu de refuser" \
+  $'    except ValueError:\n        raise ErreurInfomaniak(\n            "INFOMANIAK_ACHAT_MAX vaut %r' \
+  $'    except ValueError:\n        return ACHAT_MAX_DEFAUT\n    if False:\n        raise ErreurInfomaniak(\n            "INFOMANIAK_ACHAT_MAX vaut %r'
+
+mutant "un plafond nul autorise tout" \
+  '    if valeur <= 0:' \
+  '    if False:'
+
+mutant "la confirmation n'est plus comparée au domaine" \
+  '    if confirmation != nom:' \
+  '    if False:'
+
+mutant "la confirmation accepte une sous-chaîne" \
+  '    if confirmation != nom:' \
+  '    if confirmation not in nom:'
+
+mutant "le montant devient facultatif" \
+  '    if args.get("amount_total_excl_tax") in (None, ""):' \
+  '    if False:'
+
+mutant "un montant nul est accepté" \
+  '    if montant <= 0:' \
+  '    if montant < 0:'
+
+mutant "la période haute n'est plus bornée" \
+  '    if not 1 <= periode <= PERIODE_MAX:' \
+  '    if not 1 <= periode:'
+
+mutant "une coupure réseau n'avertit plus du rejeu" \
+  '        if "injoignable" in str(err):' \
+  '        if False:'
+
+mutant "toute erreur devient une issue indéterminée" \
+  '        if "injoignable" in str(err):' \
+  '        if True:'
 
 echo
 echo "$teste mutants, $survivants survivant(s)"
