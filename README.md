@@ -122,6 +122,25 @@ constate qu'aucune requête n'est partie, pas seulement qu'un message d'erreur
 est revenu. Les deux ne disent pas la même chose : le second reste vert si
 l'écriture est faite puis regrettée.
 
+## Un pré-tri sans jeton
+
+Avant même d'avoir un jeton, `outils/pre-tri-whois.py` dégrossit une liste de
+candidats :
+
+```bash
+python3 outils/pre-tri-whois.py exemple.ch exemple.fr exemple.press
+```
+
+Il rend « libre / pris / incertain ». Un piège y est corrigé, et il vaut d'être
+connu : quand le client whois ne suit pas la délégation vers le registre, il
+rend la fiche du **TLD** au lieu de celle du domaine — « domain: CH »,
+« organisation: SWITCH… » — et une détection naïve y voit un titulaire, donc
+déclare occupé un nom parfaitement libre. Le script le repère et retombe sur
+les serveurs de noms.
+
+Cela dit, whois ne donne pas le prix et ne dit pas si le nom est réservable :
+c'est l'outil `disponibilite` qui tranche.
+
 ## L'API en face
 
 Base `https://api.infomaniak.com`, `Authorization: Bearer …`, enveloppe
