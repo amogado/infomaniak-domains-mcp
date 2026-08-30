@@ -40,13 +40,22 @@ def egal(obtenu, attendu, quoi):
     ok(obtenu == attendu, "%s : attendu %r, obtenu %r" % (quoi, attendu, obtenu))
 
 
+_derniere_raison = [""]
+
+
 def leve(fn, morceau, quoi):
-    """L'appel doit échouer, et la raison doit *nommer* le problème."""
+    """L'appel doit échouer, et la raison doit *nommer* le problème.
+
+    La raison est retenue dans `_derniere_raison` : certains refus méritent
+    qu'on regarde ce qu'ils disent au-delà d'un mot-clé — qu'un plafond donne
+    le total calculé, qu'une indétermination interdise le rejeu."""
     global VERIFS
     VERIFS += 1
+    _derniere_raison[0] = ""
     try:
         fn()
     except ik.ErreurInfomaniak as err:
+        _derniere_raison[0] = str(err)
         if morceau.lower() not in str(err).lower():
             ECHECS.append("%s : la raison ne dit pas %r — %s" % (quoi, morceau, err))
         return
@@ -467,11 +476,35 @@ for noeud in ast.walk(arbre):
 ok(len(chemins_appeles) >= 10,
    "l'inventaire des chemins appelés a bien été construit : %d" % len(chemins_appeles))
 ok(all(isinstance(c, str) for c in chemins_appeles), "tous les chemins sont des chaînes")
-for interdit in ("/create", "/transfer"):
-    coupables = [c for c in chemins_appeles if interdit in c]
-    egal(coupables, [],
-         "aucun appel ne vise %s — acheter ou transférer n'est pas automatisable ici"
-         % interdit)
+# On ne regarde plus seulement le premier argument de `appel()` : un chemin
+# peut transiter par une variable, et l'inventaire le manquerait — donc
+# manquerait aussi un chemin d'achat dissimulé de la même façon. On cherche
+# désormais **toute chaîne littérale** du module, et dans quelle fonction elle
+# se trouve. C'est la question qu'on veut poser : qui connaît ce chemin.
+def fonctions_citant(motif):
+    trouvees = []
+    for f in ast.walk(arbre):
+        if not isinstance(f, ast.FunctionDef):
+            continue
+        for n in ast.walk(f):
+            if isinstance(n, ast.Constant) and isinstance(n.value, str) and motif in n.value:
+                trouvees.append(f.name)
+                break
+    return sorted(set(trouvees))
+
+# L'instrument voit-il ce qu'il prétend voir ? Assertion de contrôle sur un
+# motif dont on sait qu'il existe.
+ok(fonctions_citant("/2/zones/") != [],
+   "l'inventaire voit les chemins de zone, donc il verrait un chemin d'achat")
+
+egal(fonctions_citant("/transfer"), [],
+     "aucune fonction ne connaît /transfer — le transfert reste hors d'atteinte")
+
+# /create existe maintenant, mais dans UNE SEULE fonction. On ne supprime pas
+# le test qui surveillait ce chemin, on le retourne : un test effacé laisse un
+# trou exactement là où on regardait.
+egal(fonctions_citant("/create"), ["outil_commande_domaine"],
+     "seul l'outil de commande connaît /create")
 # et l'assertion inverse : l'inventaire voit bien les chemins qui existent
 ok(any("/2/zones/" in c for c in chemins_appeles),
    "l'inventaire voit les chemins de zone (donc il verrait un chemin d'achat)")
@@ -482,6 +515,12 @@ ecrivains = {t["name"] for t in ik.TOOLS if t["description"].startswith("[écrit
 egal(ecrivains, {"ajoute_enregistrement", "modifie_enregistrement",
                  "supprime_enregistrement", "serveurs_de_noms"},
      "les outils qui écrivent sont exactement ceux annoncés comme tels")
+
+depensiers = {t["name"] for t in ik.TOOLS if t["description"].startswith("[DÉPENSE]")}
+egal(depensiers, {"commande_domaine"},
+     "un seul outil engage une dépense, et il est marqué comme tel")
+ok(not (ecrivains & depensiers),
+   "les deux marques ne se recouvrent pas : écrire n'est pas dépenser")
 
 for t in ik.TOOLS:
     schema = t["inputSchema"]
@@ -498,6 +537,225 @@ ok("LECTURE SEULE" not in ik.instructions(),
    "armé, les instructions ne parlent plus de lecture seule")
 ok("armés" in ik.instructions(), "armé, les instructions le disent")
 os.environ.pop("INFOMANIAK_WRITE", None)
+
+
+
+# =================================================================== la commande
+# La règle de ce fichier vaut ici plus qu'ailleurs : quand on affirme qu'aucune
+# commande n'est passée, on le constate côté serveur — `faux_api.ETAT["commandes"]`
+# — et pas au message d'erreur reçu.
+
+def commandes():
+    return faux_api.ETAT.get("commandes", [])
+
+
+# --- non armé : rien ne part, quoi qu'on demande ---------------------------
+neuf()
+os.environ["INFOMANIAK_WRITE"] = "1"          # écrire est armé...
+os.environ.pop("INFOMANIAK_ACHAT", None)      # ...mais pas dépenser
+avant = len(faux_api.requetes())
+
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+         "amount_total_excl_tax": 6.0}),
+     "non armé", "sans INFOMANIAK_ACHAT : refus")
+ok("INFOMANIAK_ACHAT" in str(_derniere_raison[0]),
+   "le refus nomme la variable qui armerait")
+egal(commandes(), [], "aucune commande n'a été passée")
+egal(len(faux_api.requetes()), avant, "aucune requête n'est partie")
+
+# INFOMANIAK_WRITE n'arme PAS la dépense — c'est tout l'intérêt de deux
+# armements distincts, et un test doit le prouver plutôt que le supposer.
+ok(ik.ecriture_armee() and not ik.achat_arme(),
+   "écrire est armé alors que dépenser ne l'est pas : les deux sont bien séparés")
+os.environ.pop("INFOMANIAK_WRITE", None)
+
+# --- armé : les quatre barrières, une par une ------------------------------
+neuf()
+os.environ["INFOMANIAK_ACHAT"] = "1"
+
+# barrière « cible » : la confirmation doit répéter le domaine
+avant = len(commandes())
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier.ch", "confirmation": "kiosquier.fr",
+         "amount_total_excl_tax": 6.0}),
+     "confirmation", "confirmation qui ne correspond pas : refus")
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier.ch", "amount_total_excl_tax": 6.0}),
+     "confirmation", "confirmation absente : refus")
+egal(len(commandes()), avant, "aucune commande malgré deux tentatives")
+
+# barrière « montant » : obligatoire, jamais deviné
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch"}),
+     "amount_total_excl_tax", "montant absent : refus")
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+         "amount_total_excl_tax": 0}),
+     "négatif", "montant nul : refus")
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+         "amount_total_excl_tax": "beaucoup"}),
+     "nombre", "montant illisible : refus")
+egal(len(commandes()), avant, "toujours aucune commande")
+
+# le serveur ne va JAMAIS chercher le prix tout seul pour combler le montant
+egal(len(faux_api.requetes(chemin_contient="/check")), 0,
+     "aucun contrôle de prix n'est lancé en douce pour deviner le montant")
+
+# barrière « période »
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+         "amount_total_excl_tax": 6.0, "registration_period": 0}),
+     "entre 1 et 10", "période nulle : refus")
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+         "amount_total_excl_tax": 6.0, "registration_period": 11}),
+     "entre 1 et 10", "période trop longue : refus")
+
+# barrière « plafond » — et elle porte sur le TOTAL, période comprise
+neuf()
+os.environ["INFOMANIAK_ACHAT"] = "1"
+os.environ["INFOMANIAK_ACHAT_MAX"] = "50"
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+         "amount_total_excl_tax": 60.0}),
+     "plafond", "montant au-dessus du plafond : refus")
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+         "amount_total_excl_tax": 20.0, "registration_period": 5}),
+     "plafond", "5 ans à 20 € dépassent 50 € : refus")
+ok("100.00" in str(_derniere_raison[0]),
+   "le refus donne le total calculé, pas seulement le prix unitaire")
+egal(commandes(), [], "le plafond n'a rien laissé passer")
+
+# un plafond illisible REFUSE au lieu de retomber sur le défaut
+os.environ["INFOMANIAK_ACHAT_MAX"] = "cinquante"
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+         "amount_total_excl_tax": 6.0}),
+     "n'est pas un nombre", "plafond illisible : refus, pas de repli silencieux")
+os.environ["INFOMANIAK_ACHAT_MAX"] = "0"
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+         "amount_total_excl_tax": 6.0}),
+     "n'autorise aucune", "plafond nul : refus")
+egal(commandes(), [], "aucune commande sous plafond illisible ou nul")
+os.environ.pop("INFOMANIAK_ACHAT_MAX", None)
+
+# --- le chemin qui aboutit -------------------------------------------------
+neuf()
+os.environ["INFOMANIAK_ACHAT"] = "1"
+r = ik.outil_commande_domaine(
+    {"domain": "  KIOSQUIER.CH ", "confirmation": "kiosquier.ch",
+     "amount_total_excl_tax": 6.0})
+egal(r["domaine"], "kiosquier.ch", "le nom est normalisé des deux côtés")
+egal(r["annees"], 1, "une année par défaut")
+egal(len(commandes()), 1, "exactement une commande a été passée")
+egal(commandes()[0]["domain"], "kiosquier.ch", "et c'est le bon domaine")
+egal(commandes()[0]["amount_total_excl_tax"], 6.0, "avec le montant annoncé")
+egal(commandes()[0]["registration_period"], 1, "et la période")
+
+# le contrôle de montant de l'API mord vraiment : montant faux → refus
+neuf()
+os.environ["INFOMANIAK_ACHAT"] = "1"
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+         "amount_total_excl_tax": 3.0}),
+     "invalid_expected_amount", "montant qui ne colle pas au prix : l'API refuse")
+egal(commandes(), [], "et rien n'a été enregistré")
+
+# les champs facultatifs traversent quand ils sont donnés, et pas sinon
+neuf()
+os.environ["INFOMANIAK_ACHAT"] = "1"
+ik.outil_commande_domaine(
+    {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+     "amount_total_excl_tax": 6.0, "contacts": {"owner": 11}})
+egal(commandes()[0].get("contacts"), {"owner": 11}, "les contacts traversent")
+neuf()
+os.environ["INFOMANIAK_ACHAT"] = "1"
+ik.outil_commande_domaine(
+    {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+     "amount_total_excl_tax": 6.0})
+ok("contacts" not in commandes()[0],
+   "un champ facultatif absent n'est pas inventé dans le corps")
+
+# un nom sans extension n'atteint jamais le réseau
+neuf()
+os.environ["INFOMANIAK_ACHAT"] = "1"
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier", "confirmation": "kiosquier",
+         "amount_total_excl_tax": 6.0}),
+     "extension", "nom sans extension : refus")
+egal(len(faux_api.requetes()), 0, "et aucune requête n'est partie")
+
+# plusieurs comptes : on ne devine pas qui paie
+neuf()
+os.environ["INFOMANIAK_ACHAT"] = "1"
+faux_api.ETAT["comptes"] = [{"id": 90812, "name": "Un tiers"},
+                            {"id": 607373, "name": "Le bon compte"}]
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+         "amount_total_excl_tax": 6.0}),
+     "plusieurs comptes", "commande sans compte désigné : refus")
+egal(commandes(), [], "personne n'a été facturé au hasard")
+r = ik.outil_commande_domaine(
+    {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+     "amount_total_excl_tax": 6.0, "account": "607373"})
+egal(r["compte"], "607373", "le compte employé est rendu dans la réponse")
+egal(faux_api.requetes(chemin_contient="/create")[-1]["chemin"],
+     "/2/domains/accounts/607373/create", "et c'est bien celui-là qui est visé")
+
+# --- l'issue indéterminée --------------------------------------------------
+# Un échec de transport ne dit pas que la commande n'est pas passée. Le message
+# doit l'annoncer et interdire le rejeu, sinon on paie deux fois.
+neuf()
+os.environ["INFOMANIAK_ACHAT"] = "1"
+vrai_appel = ik.appel
+
+
+def appel_qui_coupe(chemin, **kw):
+    if "/create" in chemin:
+        raise ik.ErreurInfomaniak(
+            "l'API Infomaniak est injoignable sur %s : timed out" % ik.BASE)
+    return vrai_appel(chemin, **kw)
+
+
+ik.appel = appel_qui_coupe
+try:
+    leve(lambda: ik.outil_commande_domaine(
+            {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+             "amount_total_excl_tax": 6.0}),
+         "INDÉTERMINÉE", "coupure réseau : l'issue est annoncée indéterminée")
+    ok("NE PAS REJOUER" in str(_derniere_raison[0]),
+       "et le message interdit explicitement le rejeu")
+    ok("kiosquier.ch" in str(_derniere_raison[0]),
+       "le message nomme le domaine concerné, pour aller vérifier")
+finally:
+    ik.appel = vrai_appel
+
+# une erreur métier ordinaire, elle, reste rendue telle quelle
+neuf()
+os.environ["INFOMANIAK_ACHAT"] = "1"
+faux_api.ETAT["libres"]["exemple.ch"] = False
+leve(lambda: ik.outil_commande_domaine(
+        {"domain": "exemple.ch", "confirmation": "exemple.ch",
+         "amount_total_excl_tax": 6.0}),
+     "invalid_domain_action", "un refus métier n'est pas déguisé en indétermination")
+ok("INDÉTERMINÉE" not in str(_derniere_raison[0]),
+   "et il ne porte pas l'avertissement de rejeu, qui serait trompeur ici")
+
+os.environ.pop("INFOMANIAK_ACHAT", None)
+
+# les instructions annoncent l'état de l'armement de dépense, dans les deux sens
+ok("n'est PAS armé" in ik.instructions(),
+   "instructions : la dépense non armée est annoncée")
+os.environ["INFOMANIAK_ACHAT"] = "1"
+ok("ARMÉ" in ik.instructions(), "instructions : la dépense armée est annoncée")
+ok("ne jamais l'inventer" in ik.instructions().lower()
+   or "inventer" in ik.instructions(),
+   "instructions armées : le montant ne doit pas être inventé")
+os.environ.pop("INFOMANIAK_ACHAT", None)
 
 
 SERVEUR.shutdown()

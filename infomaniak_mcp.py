@@ -509,6 +509,113 @@ def outil_supprime_enregistrement(args):
     return {"supprime": identifiant, "zone": zone}
 
 
+def outil_contacts(args):
+    """Les contacts déclarés du compte : propriétaire, administratif, technique,
+    facturation. Leurs identifiants servent à renseigner une commande."""
+    compte = compte_par_defaut(args.get("account"))
+    liste = appel("/2/domains/accounts/%s/contacts"
+                  % urllib.parse.quote(str(compte), safe="")) or []
+    return {"contacts": liste, "nombre": len(liste)}
+
+
+def outil_commande_domaine(args):
+    """Enregistrer un domaine. Engage une dépense, et ne se défait pas.
+
+    Rien n'est deviné ici. Le montant vient de l'appelant, pas d'un appel que ce
+    serveur ferait à sa place : c'est ce qui donne sa valeur au contrôle
+    `invalid_expected_amount` de l'API, qui rejette l'opération si le montant
+    annoncé ne correspond pas au prix calculé.
+    """
+    nom = (args.get("domain") or "").strip().lower()
+    if not nom:
+        raise ErreurInfomaniak("il faut un domaine dans domain.")
+    if "." not in nom:
+        raise ErreurInfomaniak(
+            "« %s » n'a pas d'extension : ce n'est pas un domaine enregistrable." % nom)
+
+    # La cible d'abord : se tromper de nom est l'erreur la plus coûteuse,
+    # puisqu'elle aboutit sans rien signaler.
+    confirmation = (args.get("confirmation") or "").strip().lower()
+    if confirmation != nom:
+        raise ErreurInfomaniak(
+            "confirmation doit répéter exactement le domaine visé. Attendu %r, "
+            "reçu %r. Cette répétition existe pour qu'une opération ne puisse "
+            "pas se tromper de nom." % (nom, args.get("confirmation")))
+
+    # Le montant est fourni, jamais déduit.
+    if args.get("amount_total_excl_tax") in (None, ""):
+        raise ErreurInfomaniak(
+            "il faut amount_total_excl_tax : le montant hors taxes attendu, en "
+            "euros. Il n'est pas deviné — le lire avec l'outil disponibilite et "
+            "le reporter ici. L'API rejette l'opération s'il ne correspond pas "
+            "au prix calculé, et ce contrôle ne vaut que si le nombre a été vu.")
+    try:
+        montant = float(str(args["amount_total_excl_tax"]).replace(",", "."))
+    except ValueError:
+        raise ErreurInfomaniak("amount_total_excl_tax n'est pas un nombre : %r"
+                               % args.get("amount_total_excl_tax"))
+    if montant <= 0:
+        raise ErreurInfomaniak(
+            "amount_total_excl_tax vaut %s : un montant nul ou négatif ne "
+            "correspond à aucune opération réelle." % montant)
+
+    periode = args.get("registration_period")
+    periode = 1 if periode in (None, "") else periode
+    try:
+        periode = int(periode)
+    except (TypeError, ValueError):
+        raise ErreurInfomaniak("registration_period n'est pas un entier : %r" % periode)
+    if not 1 <= periode <= PERIODE_MAX:
+        raise ErreurInfomaniak(
+            "registration_period doit tenir entre 1 et %d ans ; reçu %d. Une "
+            "période longue multiplie la dépense d'autant." % (PERIODE_MAX, periode))
+
+    # L'armement, propre à cette classe de geste.
+    if not achat_arme():
+        raise ErreurInfomaniak(
+            "non armé : %s n'a pas été enregistré, et aucune requête n'est "
+            "partie. Pour l'autoriser, lancer le serveur avec "
+            "INFOMANIAK_ACHAT=1 — un armement distinct de INFOMANIAK_WRITE, "
+            "exprès : autoriser la modification d'une zone DNS n'autorise pas "
+            "une dépense." % nom)
+
+    # Le plafond porte sur le total, période comprise — sinon dix ans à 40 €
+    # passeraient sous un plafond de 50.
+    plafond = plafond_achat()
+    total = montant * periode
+    if total > plafond:
+        raise ErreurInfomaniak(
+            "refusé : %.2f € HT (%.2f × %d an(s)) dépasse le plafond de "
+            "%.2f €. Relever INFOMANIAK_ACHAT_MAX si le montant est voulu — en "
+            "le décidant, pas en le subissant." % (total, montant, periode, plafond))
+
+    compte = compte_par_defaut(args.get("account"))
+    corps = {"domain": nom, "amount_total_excl_tax": montant,
+             "registration_period": periode}
+    for facultatif in ("contacts", "additional_fields", "with_options", "address"):
+        if args.get(facultatif) not in (None, ""):
+            corps[facultatif] = args[facultatif]
+
+    chemin = "/2/domains/accounts/%s/create" % urllib.parse.quote(str(compte), safe="")
+    try:
+        data = appel(chemin, corps=corps, methode="POST")
+    except ErreurInfomaniak as err:
+        # Un échec de *transport* — injoignable, délai dépassé — ne dit pas que
+        # l'opération n'a pas abouti. C'est le seul endroit du serveur où
+        # l'ambiguïté coûte de l'argent, donc le seul où on la nomme au lieu de
+        # rendre l'erreur telle quelle. Surtout : ne pas rejouer.
+        if "injoignable" in str(err):
+            raise ErreurInfomaniak(
+                "ISSUE INDÉTERMINÉE pour %s : %s. La requête a pu partir et "
+                "aboutir. NE PAS REJOUER — vérifier d'abord avec l'outil "
+                "« domaines », ou dans le manager, si le domaine figure "
+                "désormais au compte %s." % (nom, err, compte))
+        raise
+
+    return {"domaine": nom, "montant_ht": montant, "annees": periode,
+            "compte": str(compte), "reponse": data}
+
+
 def outil_serveurs_de_noms(args):
     """Changer les serveurs de noms d'un domaine. Geste lourd : il déplace
     l'autorité entière du domaine, et la propagation prend des heures."""
@@ -531,8 +638,9 @@ def outil_serveurs_de_noms(args):
 # table des outils
 # --------------------------------------------------------------------------
 
-def _o(nom, description, proprietes, requis, handler, ecrit=False):
-    titre = ("[écrit] " if ecrit else "") + description
+def _o(nom, description, proprietes, requis, handler, ecrit=False, depense=False):
+    marque = "[DÉPENSE] " if depense else ("[écrit] " if ecrit else "")
+    titre = marque + description
     return {
         "name": nom,
         "description": titre,
@@ -604,6 +712,30 @@ TOOLS = [
        {"zone": S, "record": E},
        ["zone", "record"], outil_supprime_enregistrement, ecrit=True),
 
+    _o("contacts",
+       "Les contacts du compte : propriétaire, administratif, technique, "
+       "facturation. Leurs identifiants servent à renseigner une commande.",
+       {"account": S}, [], outil_contacts),
+
+    _o("commande_domaine",
+       "Enregistrer un domaine. Engage une dépense qui ne se défait pas. Exige "
+       "un armement propre (INFOMANIAK_ACHAT=1), reste sous un plafond, et "
+       "n'accepte que le montant que l'appelant a lu lui-même avec "
+       "« disponibilite » — il n'est jamais deviné.",
+       {"domain": dict(S, description="le domaine à enregistrer"),
+        "confirmation": dict(S, description="répéter exactement le même domaine"),
+        "amount_total_excl_tax": {"type": "number",
+                                  "description": "le montant HT attendu, lu avec disponibilite"},
+        "registration_period": dict(E, description="en années, 1 par défaut, 10 au plus"),
+        "contacts": {"type": "object", "description": "identifiants owner/admin/tech/billing"},
+        "additional_fields": {"type": "array", "items": S,
+                              "description": "champs exigés par certaines extensions"},
+        "with_options": {"type": "object", "description": "options payantes"},
+        "address": dict(E, description="identifiant d'adresse de facturation"),
+        "account": S},
+       ["domain", "confirmation", "amount_total_excl_tax"],
+       outil_commande_domaine, depense=True),
+
     _o("serveurs_de_noms",
        "Remplacer les serveurs de noms d'un domaine. Déplace l'autorité entière ; "
        "la propagation prend des heures.",
@@ -628,11 +760,22 @@ def instructions():
             if ecriture_armee() else
             "Le serveur est en LECTURE SEULE : les outils marqués [écrit] "
             "refuseront d'agir tant que INFOMANIAK_WRITE=1 n'est pas posé.")
+    if achat_arme():
+        depense = (" L'enregistrement de domaine est ARMÉ : « commande_domaine » "
+                   "engagera une dépense réelle. Le montant doit être lu avec "
+                   "« disponibilite » et reporté tel quel — ne jamais l'inventer, "
+                   "l'API le vérifie. Ne jamais rejouer un appel dont l'issue "
+                   "est inconnue.")
+    else:
+        depense = (" L'enregistrement de domaine n'est PAS armé : "
+                   "« commande_domaine » refusera, sans qu'aucune requête ne "
+                   "parte. Il faut INFOMANIAK_ACHAT=1, distinct de "
+                   "INFOMANIAK_WRITE.")
     return ("Opère les domaines et les zones DNS d'un compte Infomaniak : "
             "lister les domaines, contrôler la disponibilité et le prix d'un "
-            "nom, lire et modifier les enregistrements DNS. " + etat +
-            " Aucun outil n'achète ni ne transfère de domaine : ces gestes "
-            "engagent de l'argent et se font à la main dans le manager.")
+            "nom, lire et modifier les enregistrements DNS, et enregistrer un "
+            "domaine. " + etat + depense +
+            " Aucun outil ne transfère de domaine.")
 
 
 def handle(message):

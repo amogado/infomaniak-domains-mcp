@@ -49,6 +49,7 @@ def remise_a_zero():
             # forçages, pour éprouver les chemins d'erreur
             "force_code": None,
             "force_corps": None,
+            "commandes": [],
         })
 
 
@@ -164,6 +165,30 @@ class Poignee(BaseHTTPRequestHandler):
         if len(seg) == 5 and seg[4] == "nameservers" and methode == "PUT":
             noms = (corps or {}).get("nameservers") or []
             return self._succes({"domain": seg[3], "nameservers": noms})
+
+        # /2/domains/accounts/{account}/create  — l'enregistrement
+        if len(seg) == 5 and seg[:3] == ["2", "domains", "accounts"] and seg[4] == "create":
+            c = corps or {}
+            nom = c.get("domain") or ""
+            attendu = ETAT.get("prix_premiere", 6.0) * int(c.get("registration_period") or 1)
+            # Le contrôle qui compte : l'API rejette si le montant annoncé ne
+            # correspond pas au prix calculé. On l'imite fidèlement, sinon les
+            # tests laisseraient croire que ce filet existe alors qu'il n'a
+            # jamais été éprouvé.
+            if abs(float(c.get("amount_total_excl_tax") or 0) - attendu) > 0.001:
+                return self._echec(400, "invalid_expected_amount",
+                                   "montant attendu %.2f" % attendu)
+            if not ETAT["libres"].get(nom, True):
+                return self._echec(400, "invalid_domain_action",
+                                   "ce domaine n'est pas enregistrable")
+            ETAT.setdefault("commandes", []).append(dict(c))
+            ETAT["libres"][nom] = False
+            return self._succes({"domain": nom, "status": "pending",
+                                 "order_id": 4711})
+
+        # /2/domains/accounts/{account}/contacts
+        if len(seg) == 5 and seg[:3] == ["2", "domains", "accounts"] and seg[4] == "contacts":
+            return self._succes(ETAT.get("contacts", [{"id": 11, "type": "owner"}]))
 
         # /2/domains/accounts/{account}/check
         if len(seg) == 5 and seg[:3] == ["2", "domains", "accounts"] and seg[4] == "check":

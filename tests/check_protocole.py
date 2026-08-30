@@ -108,8 +108,12 @@ egal(r["result"]["serverInfo"]["name"], "infomaniak-domains", "initialize : le n
 ok(r["result"]["capabilities"]["tools"] is not None, "initialize : la capacité outils")
 ok("LECTURE SEULE" in r["result"]["instructions"],
    "initialize : les instructions annoncent la lecture seule")
-ok("achète" in r["result"]["instructions"] or "achete" in r["result"]["instructions"],
-   "initialize : les instructions disent qu'aucun outil n'achète")
+# Le client doit savoir dès la poignée de main si une dépense est possible.
+# Ici le serveur est lancé sans INFOMANIAK_ACHAT, donc il doit le dire.
+ok("n'est PAS armé" in r["result"]["instructions"],
+   "initialize : les instructions annoncent que la dépense n'est pas armée")
+ok("transfère" in r["result"]["instructions"],
+   "initialize : les instructions disent qu'aucun outil ne transfère")
 
 c.notifie("notifications/initialized")
 egal(c.demande("ping")["result"], {}, "ping")
@@ -173,6 +177,16 @@ r = c.demande("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}
                              "clientInfo": {"name": "test", "version": "0"}})
 ok("LECTURE SEULE" not in r["result"]["instructions"],
    "armé : les instructions ne parlent plus de lecture seule")
+
+# La dépense reste NON armée alors que l'écriture l'est : les deux armements
+# sont indépendants, et ça se vérifie à travers le protocole, pas seulement en
+# appelant les fonctions en direct.
+r = c.appelle("commande_domaine",
+              {"domain": "kiosquier.ch", "confirmation": "kiosquier.ch",
+               "amount_total_excl_tax": 6.0})
+ok(r["result"]["isError"], "armé en écriture, la commande refuse quand même")
+ok("INFOMANIAK_ACHAT" in texte(r), "et le refus nomme l'armement qui manque")
+egal(faux_api.ETAT.get("commandes"), [], "aucune commande n'a été passée")
 
 r = c.appelle("ajoute_enregistrement",
               {"zone": "exemple.ch", "type": "TXT", "source": "_test",
