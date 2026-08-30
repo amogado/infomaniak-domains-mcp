@@ -14,5 +14,6 @@ Révisé le 2026-08-30.
 
 | # | ID | Sujet | Spec | Décision | Pourquoi ce rang |
 |---|---|---|---|---|---|
+| 1 | D1 | `_humain_present()` croit un en-tête que l'appelant écrit lui-même | `docs/specs/2026-08-30-connecteur-claude.md` | Comparer une marque que seul le proxy peut produire, avec hmac.compare_digest ; middleware Traefik qui la pose ET écrase toute copie entrante. | C'est le filet qui garde la page émettant les codes d'autorisation. Aujourd'hui `Authorization: Basic n'importe-quoi` ou `X-Forwarded-User: x` le franchit, et le pod écoute sur 8080 sans NetworkPolicy : tout voisin du cluster atteint /authorize sans passer par Traefik. Gravité haute, et c'est la dernière avant déploiement. |
 
 Fin.
