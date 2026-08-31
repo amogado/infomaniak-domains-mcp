@@ -118,10 +118,10 @@ spec:
   ingressClassName: traefik
   tls:
     - hosts:
-        - domaines.ephais.eu
+        - domains.mcp.ephais.eu
       secretName: infomaniak-domains-tls
   rules:
-    - host: domaines.ephais.eu
+    - host: domains.mcp.ephais.eu
       http:
         paths:
           - path: /
@@ -206,10 +206,10 @@ spec:
     # On s'y réfère seulement : ce secret est rempli par l'Ingress humain, qui
     # porte l'issuer.
     - hosts:
-        - domaines.ephais.eu
+        - domains.mcp.ephais.eu
       secretName: infomaniak-domains-tls
   rules:
-    - host: domaines.ephais.eu
+    - host: domains.mcp.ephais.eu
       http:
         paths:
           - path: /mcp

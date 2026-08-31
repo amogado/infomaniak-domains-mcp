@@ -1882,7 +1882,7 @@ class Poignee(BaseHTTPRequestHandler):
         dépôt alors que le ConfigMap servait une variante divergente.
         Comparer :
 
-            curl -s https://domaines.ephais.eu/_whoami
+            curl -s https://domains.mcp.ephais.eu/_whoami
             git show HEAD:serveur.py | shasum -a 256
 
         Ce qui est servi n'apprend rien à qui n'a pas le mot de passe : le

@@ -52,7 +52,7 @@ python3 -c "import ast; ast.parse(open('infomaniak_mcp.py').read())" || casse=1
 # `INFOMANIAK_FRONTIERE=-` coupe la sonde. Le harnais de mutants s'en sert : il
 # mesure si les tests LOCAUX mordent, et la réponse d'un hôte distant n'est pas
 # ce signal-là — même raison que `INFOMANIAK_RATE` plus haut.
-HOTE_FRONTIERE="${INFOMANIAK_FRONTIERE-https://domaines.ephais.eu}"
+HOTE_FRONTIERE="${INFOMANIAK_FRONTIERE-https://domains.mcp.ephais.eu}"
 
 echo
 echo "== la frontière, depuis dehors et sans mot de passe =="

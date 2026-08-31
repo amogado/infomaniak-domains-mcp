@@ -67,7 +67,7 @@ spec:
             # Toutes les URL absolues des documents de découverte OAuth en
             # viennent — jamais de l'en-tête Host, qu'un client peut forger.
             - name: INFOMANIAK_PUBLIC_BASE
-              value: https://domaines.ephais.eu
+              value: https://domains.mcp.ephais.eu
             # Une frontière, pas un défaut : le jeton voit potentiellement
             # d'autres comptes, et les zones DNS s'adressent par nom. Épinglé,
             # le serveur ne peut pas toucher la zone de quelqu'un d'autre.

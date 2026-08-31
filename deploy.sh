@@ -159,6 +159,6 @@ echo "==> Rollout"
 $K rollout restart deploy/infomaniak-domains
 $K rollout status  deploy/infomaniak-domains --timeout=120s
 
-echo "==> OK — https://domaines.ephais.eu"
+echo "==> OK — https://domains.mcp.ephais.eu"
 echo "    La frontière ne se vérifie que de l'extérieur, sans mot de passe :"
-echo "    ./tests/check_frontiere.sh https://domaines.ephais.eu"
+echo "    ./tests/check_frontiere.sh https://domains.mcp.ephais.eu"

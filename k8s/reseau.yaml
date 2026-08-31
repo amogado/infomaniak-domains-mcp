@@ -19,7 +19,7 @@
 #               est donc celle que k3s embarque dans son agent — la bibliothèque
 #               kube-router, en processus, sans pod à interroger. D'où
 #               l'impossibilité de lire ses journaux : il n'y en a pas à lire.
-#   Entrée      `domaines.ephais.eu` résout vers 95.217.21.250, donc homa-eu-1,
+#   Entrée      `domains.mcp.ephais.eu` résout vers 95.217.21.250, donc homa-eu-1,
 #               et vers lui SEUL. Traefik est un DaemonSet avec `hostPort` 80 et
 #               443 (pas de `hostNetwork`) : le trafic public entre par le nœud
 #               eu-1, est traduit vers le pod Traefik de ce nœud (10.42.0.246),
@@ -92,7 +92,7 @@
 # propre policy, et branché derrière le vrai Traefik par un Ingress temporaire :
 # la topologie du connecteur, à l'identique, mais sans le connecteur.
 #
-# « ext » = requête HTTPS publique sur domaines.ephais.eu, donc par eu-1.
+# « ext » = requête HTTPS publique sur domains.mcp.ephais.eu, donc par eu-1.
 # « voisin eu-N » = un pod du namespace `default`, sur le nœud N, qui vise le
 # port 8080 du témoin en direct.
 #
@@ -151,7 +151,7 @@
 #
 # Et la porte de service donne sur le vide : le pod épinglé sur homa-eu-1, une
 # vidange de ce nœud le rend non ordonnançable, et l'enregistrement A de
-# domaines.ephais.eu — qui n'est pas dans notre main — le déplacerait tout
+# domains.mcp.ephais.eu — qui n'est pas dans notre main — le déplacerait tout
 # autant. Dans les deux cas le connecteur tombe en silence, sans que rien n'ait
 # changé de visible. Un garde-fou dont la panne ressemble à la panne qu'il
 # prétend empêcher n'en est pas un.

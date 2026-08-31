@@ -14,7 +14,7 @@ case vide se suppose, et une supposition coûte plus cher qu'une question.
 | Rouge / vert ? | `./tests/run.sh` — 671 vérifications, sans réseau ni jeton |
 | Les tests mordent-ils ? | `./tests/mutants.sh` — 43 mutants, 0 survivant |
 | Déployer ? | `./deploy.sh` (tenant `infomaniak-domains`) — **jamais utilisé à ce jour** |
-| Hôte canonique | `domaines.ephais.eu` — DNS posé, rien de déployé dessus |
+| Hôte canonique | `domains.mcp.ephais.eu` — DNS posé, rien de déployé dessus |
 | Quel artefact tourne ? | **non établi** — voir D12 |
 | Où vit la dette ? | `TODO.md`, écrit **uniquement** par le binaire `todo`, sur `origin/main` |
 | Gestes irréversibles | écriture DNS, enregistrement de domaine, révocation d'autorisation |

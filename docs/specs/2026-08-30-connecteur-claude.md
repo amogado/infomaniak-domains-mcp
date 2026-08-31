@@ -16,7 +16,7 @@ serveur d'autorisation OAuth 2.1.
 | Décision | Raison |
 |---|---|
 | Tenant homa dédié `infomaniak-domains` | Choix de Vincent : un service, un connecteur, un dépôt. Une panne de kiosquier n'emporte pas la gestion des domaines. ~0,11 €/mois. |
-| Hôte `domaines.ephais.eu` | Sous-domaine d'un domaine déjà possédé : rien à acheter, et le nom dit la fonction sans mélanger avec kiosquier. |
+| Hôte `domains.mcp.ephais.eu` | Sous-domaine d'un domaine déjà possédé : rien à acheter, et le nom dit la fonction sans mélanger avec kiosquier. |
 | **Un seul jeu d'outils, deux transports** | `infomaniak_mcp.py` reste la source de vérité des outils et de leurs schémas. Le serveur HTTP les importe. Deux définitions divergeraient, et la divergence se verrait en production, pas en test. |
 | Couche OAuth calquée sur kiosquier | Elle est éprouvée par 431 lignes de tests de bout en bout, et ses pièges sont documentés. Réécrire de zéro un serveur d'autorisation, c'est réintroduire les mêmes failles une par une. |
 | L'état OAuth sur un PVC | Un code non persisté est un code rejouable indéfiniment. |
@@ -109,12 +109,12 @@ armer se décide par un patch explicite du Deployment, pas par oubli.
 
 ```bash
 # 1. la découverte répond, sans authentification, depuis l'extérieur
-curl -s https://domaines.ephais.eu/.well-known/oauth-authorization-server \
+curl -s https://domains.mcp.ephais.eu/.well-known/oauth-authorization-server \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["issuer"])'
-# doit imprimer https://domaines.ephais.eu
+# doit imprimer https://domains.mcp.ephais.eu
 
 # 2. la frontière est exacte, pas préfixée
-./tests/check_frontiere.sh https://domaines.ephais.eu
+./tests/check_frontiere.sh https://domains.mcp.ephais.eu
 # 0 échec, et /mcpXXX doit répondre 401
 
 # 3. l'OAuth de bout en bout, sur un serveur jetable

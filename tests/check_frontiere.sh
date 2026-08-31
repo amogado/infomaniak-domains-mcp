@@ -12,7 +12,7 @@
 #
 #   ./tests/check_frontiere.sh [https://hote]
 set -uo pipefail
-HOTE="${1:-https://domaines.ephais.eu}"
+HOTE="${1:-https://domains.mcp.ephais.eu}"
 VERTS=0; ROUGES=0; ECHECS=()
 
 sonde () {  # sonde <méthode> <chemin> <attendu> <motif www-authenticate|-> <pourquoi> [type]
