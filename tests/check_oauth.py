@@ -812,6 +812,49 @@ try:
         ok(faux_api.JETON not in sortie_serveur(),
            "ni dans ce que le serveur a journalisé")
 
+    # ---------------------------------------------------------------------------
+    # La CSP de la page de consentement doit laisser PARTIR la redirection.
+    #
+    # `form-action` s'applique aussi à la CIBLE D'UNE REDIRECTION qui suit une
+    # soumission. Avec `form-action 'self'`, le serveur émet bien son 302 vers
+    # l'adresse de retour — et le navigateur le REFUSE, sans rien dire : le bouton
+    # « Autoriser » paraît sans effet, et on peut cliquer indéfiniment.
+    #
+    # Constaté sur le connecteur voisin le 2026-08-31, après six codes émis et zéro
+    # jeton échangé. La seule trace est dans la console du navigateur :
+    #   « Refused to load … because it does not appear in the form-action
+    #     directive of the Content Security Policy. »
+    # Aucun test côté serveur ne pouvait la voir : le serveur, lui, répondait bien.
+    verif, defi = pkce()
+    statut, tetes, _ = page_consentement({
+        "response_type": "code", "client_id": CLIENT, "redirect_uri": REDIRECT,
+        "code_challenge": defi, "code_challenge_method": "S256",
+        "state": "csp", "scope": "domaines:lire"})
+    egal(statut, 200, "csp : la page de consentement est rendue")
+    csp = ""
+    for nom, valeur in (tetes or {}).items():
+        if nom.lower() == "content-security-policy":
+            csp = valeur
+    ok(csp != "", "csp : la page porte une Content-Security-Policy")
+    ok("form-action" in csp, "csp : elle contient une directive form-action")
+    origine = "/".join(REDIRECT.split("/")[:3])
+    ok(origine in csp,
+       "csp : form-action nomme l'adresse de retour %s — sans elle le navigateur "
+       "refuse la redirection et le code n'atteint jamais le client : %r"
+       % (origine, csp))
+
+    # Et l'assertion inverse : la page d'accueil, dont le formulaire poste vers
+    # /revoke, doit RESTER en 'self'. Élargir sa CSP sans raison serait une
+    # régression silencieuse.
+    statut, tetes, _ = get("/", HUMAIN)
+    accueil = ""
+    for nom, valeur in (tetes or {}).items():
+        if nom.lower() == "content-security-policy":
+            accueil = valeur
+    ok(origine not in accueil,
+       "csp : la page d'accueil ne nomme PAS l'adresse de retour — son formulaire "
+       "ne quitte jamais le site : %r" % accueil)
+
 except Exception as err:                                    # noqa: BLE001
     import traceback
     ECHECS.append("la suite s'est interrompue : %s: %s\n%s"
@@ -847,6 +890,7 @@ if ECHECS and QUEUE.strip():
 # donc révoquait toute la famille. Trouvé par audit adverse le 2026-08-31.
 # Le vérifier demande deux appels : celui qui refuse, puis celui qui doit
 # encore marcher.
+
 print("%d vérifications, %d échec(s)" % (VERIFS, len(ECHECS)))
 for e in ECHECS:
     print("  ✗", e)

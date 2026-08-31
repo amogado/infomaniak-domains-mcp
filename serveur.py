@@ -1424,10 +1424,29 @@ class Poignee(BaseHTTPRequestHandler):
             return self._send(500, page_refus(
                 "Impossible d'enregistrer la demande",
                 "Le volume n'est pas accessible en écriture."))
+        # `form-action` doit nommer l'adresse de retour, pas seulement 'self'.
+        #
+        # Elle s'applique aussi à la CIBLE D'UNE REDIRECTION qui suit une
+        # soumission. Avec 'self' seul, le formulaire part bien vers /consent,
+        # le serveur émet bien son 302 vers le client — et le navigateur le
+        # REFUSE, sans rien dire à l'utilisateur : le bouton « Autoriser »
+        # paraît sans effet, et on peut cliquer indéfiniment.
+        #
+        # Constaté sur le connecteur voisin le 2026-08-31, après six codes émis
+        # et zéro jeton échangé. La seule trace est dans la console du
+        # navigateur ; aucun test côté serveur ne pouvait la voir, puisque le
+        # serveur, lui, répondait correctement.
+        #
+        # On ne nomme que les adresses ENREGISTRÉES : élargir à « https: »
+        # rendrait la directive inutile. La page d'accueil, dont le formulaire
+        # ne quitte jamais le site, reste en 'self' — et un test l'exige.
+        origines = " ".join(sorted({
+            "/".join(u.split("/")[:3]) for u in ALLOWED_REDIRECTS
+            if u.startswith("https://")}))
         return self._send(200, page_consentement(csrf, redirect_uri, scope), extra=[
             ("Content-Security-Policy",
-             "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
-             "frame-ancestors 'none'"),
+             "default-src 'none'; style-src 'unsafe-inline'; "
+             "form-action 'self' %s; frame-ancestors 'none'" % origines),
             ("X-Frame-Options", "DENY")])
 
     def _consent(self):
