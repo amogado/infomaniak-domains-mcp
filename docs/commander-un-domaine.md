@@ -118,7 +118,10 @@ Pour **`.app`**, un seul champ est requis à l'enregistrement :
 |---|---|---|
 | `x-accept-ssl-requirement` | case à cocher, motif `^1$` | `"1"` |
 
-C'est la reconnaissance que `.app` impose HTTPS. Ce qui est vrai et vous
+C'est la reconnaissance que `.app` impose HTTPS. **Attention à la forme** : la
+spec déclare `additional_fields` comme un tableau de chaînes, mais ce qui passe
+est un **objet** `{"x-accept-ssl-requirement": "1"}` — détail développé dans
+[app-champ-additionnel.md](app-champ-additionnel.md). Ce qui est vrai et vous
 concernera ensuite : **le TLD `.app` est préchargé HSTS**, donc aucun repli en
 clair et **aucun avertissement cliquable** si le certificat manque. Émettez le
 certificat *avant* d'ouvrir la page dans un navigateur.
