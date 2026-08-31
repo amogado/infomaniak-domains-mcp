@@ -15,5 +15,6 @@ adresse valide vers cette ligne.
 | D3 | La fenêtre de grâce de /consent re-livre un code déjà consommé | `70826bc` | La fenêtre de grâce ne re-livre plus un code déjà consommé : l'entrée codes[empreinte] est relue, absente ou used donne 400. Test : recharger /consent après un échange rend un refus, plus le même code. |
 | D4 | Chaque /token anonyme réécrit tout l'état OAuth sur le PVC | `70826bc` | Un /token anonyme ne réécrit plus l'état : oauth_menage rend le nombre d'entrées écartées et les six chemins de refus ne persistent que si le ménage a retiré quelque chose. Mesuré par inode et mtime inchangés sur 23 requêtes. |
 | D5 | `POST /revoke` n'a ni jeton anti-CSRF ni contrôle d'origine | `70826bc` | POST /revoke a désormais son jeton anti-CSRF à usage unique, plus les contrôles Origin et Sec-Fetch-Site, comme /consent. Test : une révocation sans jeton est refusée. |
+| D7 | PKCE : `encode('ascii','ignore')` tronque, donc accepte un verifier différent | `70826bc` | PKCE vérifie la forme avant de hacher : re.fullmatch [A-Za-z0-9._~-]{43,128} hors du verrou, puis encode('ascii') sans 'ignore'. Test : un code_verifier hors du jeu de caractères du RFC 7636 est refusé, et le verifier légitime marche encore après. |
 
 Fin.
