@@ -16,5 +16,6 @@ adresse valide vers cette ligne.
 | D4 | Chaque /token anonyme réécrit tout l'état OAuth sur le PVC | `70826bc` | Un /token anonyme ne réécrit plus l'état : oauth_menage rend le nombre d'entrées écartées et les six chemins de refus ne persistent que si le ménage a retiré quelque chose. Mesuré par inode et mtime inchangés sur 23 requêtes. |
 | D5 | `POST /revoke` n'a ni jeton anti-CSRF ni contrôle d'origine | `70826bc` | POST /revoke a désormais son jeton anti-CSRF à usage unique, plus les contrôles Origin et Sec-Fetch-Site, comme /consent. Test : une révocation sans jeton est refusée. |
 | D7 | PKCE : `encode('ascii','ignore')` tronque, donc accepte un verifier différent | `70826bc` | PKCE vérifie la forme avant de hacher : re.fullmatch [A-Za-z0-9._~-]{43,128} hors du verrou, puis encode('ascii') sans 'ignore'. Test : un code_verifier hors du jeu de caractères du RFC 7636 est refusé, et le verifier légitime marche encore après. |
+| D8 | Le contrôle de portée de /mcp plante sur des params malformés | `70826bc` | Le contrôle de portée de /mcp ne plante plus sur des params malformés : isinstance(params, dict) et isinstance(nom, str) le rendent inconditionnel, et infomaniak_mcp.handle() est durci de même. Une erreur JSON-RPC -32602 est rendue au lieu d'une socket coupée. |
 
 Fin.
