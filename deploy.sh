@@ -6,7 +6,7 @@
 # variante ne peut survivre dans le cluster sans être ici.
 #
 # ---------------------------------------------------------------------------
-# Les deux Secrets, à créer UNE FOIS, hors dépôt
+# Les trois Secrets, à créer UNE FOIS, hors dépôt
 # ---------------------------------------------------------------------------
 #
 # 1. Le jeton d'API Infomaniak. Jamais dans un fichier, jamais dans une sortie
@@ -37,6 +37,29 @@
 #            infomaniak-domains-basicauth --from-file=users=/dev/stdin
 #
 #    La clé s'appelle `users` : c'est celle que le middleware Traefik lit.
+#
+# 3. La marque du proxy (dette D1) — le secret partagé entre Traefik et le
+#    conteneur. Personne n'a besoin de la connaître : ni vous, ni Vincent. Elle
+#    n'est lue que par le Middleware et par le pod, tous deux depuis ce Secret.
+#    On la tire donc du hasard, et on ne la regarde jamais :
+#
+#      head -c 32 /dev/urandom | base64 | tr -d '\n=+/' \
+#        | kubectl -n infomaniak-domains-default create secret generic \
+#            infomaniak-marque-proxy --from-file=marque=/dev/stdin
+#
+#    Elle ne traverse ni fichier ni sortie lisible : /dev/urandom va dans le
+#    tuyau, le tuyau va dans kubectl, et rien ne s'arrête entre les deux — pas
+#    d'argument visible dans `ps`, pas de ligne dans l'historique du shell, pas
+#    de fichier temporaire. Le `tr` retire le saut de ligne, le remplissage et
+#    les deux caractères de base64 qui ne sont pas alphanumériques : ce qui
+#    reste est ~40 caractères sûrs à la fois dans un en-tête HTTP, dans du YAML
+#    et dans un shell. `marque_middleware.py` refuse tout le reste.
+#
+#    Pour la tourner : `kubectl delete secret infomaniak-marque-proxy`, rejouer
+#    la commande ci-dessus, puis `./deploy.sh` — qui re-rend le Middleware ET
+#    redémarre le pod. Les deux côtés changent ensemble parce qu'ils lisent la
+#    même clé ; les tourner séparément fermerait les pages humaines jusqu'au
+#    second geste.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -49,7 +72,15 @@ echo "==> Vérifications"
 # Fail-closed : mieux vaut refuser de déployer que laisser tourner un pod qui
 # boucle en CrashLoop parce qu'un Secret manque. L'absence tombe du côté qui
 # alarme.
-for s in infomaniak-token infomaniak-domains-basicauth; do
+#
+# `infomaniak-marque-proxy` mérite un mot de plus que les deux autres. Sans lui,
+# le déploiement ne planterait PAS : le pod démarrerait, /healthz répondrait, le
+# connecteur MCP marcherait — et /, /authorize, /consent et /revoke seraient
+# fermés à tout le monde, Vincent compris, parce que `_humain_present()` retombe
+# alors sur la boucle locale. Personne ne pourrait plus autoriser Claude, et
+# rien n'aurait l'air cassé. C'est exactement le genre de panne qu'on paye une
+# demi-journée ; on la refuse ici, en une ligne.
+for s in infomaniak-token infomaniak-domains-basicauth infomaniak-marque-proxy; do
   if ! $K get secret "$s" >/dev/null 2>&1; then
     echo "   Secret « $s » absent du namespace $NS." >&2
     echo "   Sa création est documentée en tête de ce fichier." >&2
@@ -79,6 +110,41 @@ echo "==> ConfigMap ($OCTETS octets)"
 $K create configmap infomaniak-domains-app \
   --from-file="${SRC[0]}" --from-file="${SRC[1]}" \
   --dry-run=client -o yaml | $K apply -f -
+
+echo "==> La marque du proxy"
+# AVANT networking.yaml, et l'ordre n'est pas cosmétique : l'Ingress humain
+# référence ce Middleware par annotation, et Traefik rend 500 sur une route dont
+# un middleware manque. Le poser d'abord, c'est ne jamais traverser un état où
+# le site est ouvert-mais-cassé.
+#
+# La valeur ne s'arrête nulle part : le Secret va dans le tuyau, le tuyau va
+# dans le générateur, le générateur va dans kubectl. Pas de fichier
+# intermédiaire, pas d'argument visible dans `ps`, rien d'imprimé sur le
+# terminal — `marque_middleware.py` ne dit sur sa sortie d'erreur que le nom de
+# l'en-tête et le NOMBRE de caractères. `set -o pipefail` fait qu'un refus du
+# générateur arrête le déploiement au lieu d'appliquer un manifeste tronqué.
+#
+# Le générateur lit le nom de l'en-tête et celui de la variable dans l'AST de
+# serveur.py, et vérifie que k8s/deployment.yaml injecte bien cette variable :
+# les trois écritures d'un même nom ne peuvent donc pas diverger. C'est le seul
+# écart qu'aucun test du dépôt ne verrait — il faudrait un test qui parle à la
+# fois au proxy et au serveur, et il n'en existe pas.
+#
+# Le Secret existe — la boucle ci-dessus l'a vérifié — mais rien ne dit qu'il
+# porte la bonne CLÉ : `--from-file=marque=/dev/stdin` mal recopié donne un
+# Secret d'apparence normale et de contenu vide. On ne canalise pas cette
+# vérification dans un `grep -q` : sous `pipefail`, un `grep` qui a trouvé
+# ferme le tuyau, kubectl prend un SIGPIPE, et le succès se met à ressembler à
+# un échec. La substitution de commande n'a pas ce défaut.
+if [ -z "$($K get secret infomaniak-marque-proxy -o jsonpath='{.data.marque}')" ]; then
+  echo "   Le Secret infomaniak-marque-proxy n'a pas de clé « marque » non vide." >&2
+  echo "   Sa création est documentée en tête de ce fichier." >&2
+  exit 1
+fi
+$K get secret infomaniak-marque-proxy -o jsonpath='{.data.marque}' \
+  | python3 "$HERE/k8s/marque_middleware.py" \
+      "$HERE/serveur.py" "$HERE/k8s/deployment.yaml" \
+  | $K apply -f -
 
 echo "==> Manifests"
 $K apply -f "$HERE/k8s/networking.yaml"

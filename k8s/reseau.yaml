@@ -1,26 +1,176 @@
-# ⚠️ CE MANIFESTE N'EST PAS APPLIQUÉ — il coupe Traefik. Voir la dette D13.
+# ⚠️ CE MANIFESTE N'EST PAS APPLIQUÉ — et on sait maintenant pourquoi, mesures
+# à l'appui. Voir la dette D13. Ce qui suit est constaté, pas supposé.
 #
-# Mesuré le 2026-08-31, deux fois : avec cette policy, les chemins machine
-# rendent 502 ; sans elle, 200 et 401. Pourtant le pod porte bien
-# `app: infomaniak-domains`, `kube-system` porte bien
-# `kubernetes.io/metadata.name`, et Traefik n'est pas en hostNetwork
-# (adresses de pod 10.42.0.246 et 10.42.1.169). Ajouter un ipBlock sur le
-# réseau des nœuds (10.0.0.0/16) n'a rien changé non plus.
+# ---------------------------------------------------------------------------
+# Le terrain, établi et non déduit
+# ---------------------------------------------------------------------------
 #
-# La cause n'est donc pas établie, et on ne déploie pas un garde-fou dont
-# on ne comprend pas le comportement : il couperait le service en croyant
-# le protéger.
+#   Kubernetes  k3s v1.35.5+k3s1, deux nœuds — homa-eu-1 (10.0.1.10, publique
+#               95.217.21.250, podCIDR 10.42.0.0/24) et homa-eu-2 (10.0.1.11,
+#               publique 65.108.95.216, podCIDR 10.42.1.0/24).
+#   CNI         flannel, dorsale VXLAN. Lu sur les nœuds eux-mêmes, pas déduit :
+#               `flannel.alpha.coreos.com/backend-type = vxlan`,
+#               `.../kube-subnet-manager = true`, VNI 1.
+#   NetworkPolicy
+#               AUCUN contrôleur en pod : le seul DaemonSet de kube-system est
+#               `traefik`, et il n'existe nulle part de pod calico, cilium,
+#               kube-router, weave ou antrea. Les policies sont pourtant
+#               appliquées (mesuré : `ingress: []` coupe tout). L'application
+#               est donc celle que k3s embarque dans son agent — la bibliothèque
+#               kube-router, en processus, sans pod à interroger. D'où
+#               l'impossibilité de lire ses journaux : il n'y en a pas à lire.
+#   Entrée      `domaines.ephais.eu` résout vers 95.217.21.250, donc homa-eu-1,
+#               et vers lui SEUL. Traefik est un DaemonSet avec `hostPort` 80 et
+#               443 (pas de `hostNetwork`) : le trafic public entre par le nœud
+#               eu-1, est traduit vers le pod Traefik de ce nœud (10.42.0.246),
+#               qui se connecte ensuite au pod du connecteur. Aujourd'hui ce pod
+#               est sur homa-eu-2. La requête publique traverse donc TOUJOURS
+#               une frontière de nœud.
 #
-# Le pod n'accepte de trafic que de l'ingress, jamais d'un voisin du cluster.
+# ---------------------------------------------------------------------------
+# La cause
+# ---------------------------------------------------------------------------
 #
-# Sans elle, `_humain_present()` — le filet qui garde la page émettant les codes
-# d'autorisation — se contourne en joignant le pod sur 8080 en direct, sans
-# passer par Traefik ni son Basic Auth. C'est exactement le scénario nommé par
-# l'audit adverse du 2026-08-31 (dette D1). Corriger `_humain_present` reste à
-# faire ; cette policy retire d'abord le chemin qui rend la faille atteignable.
+# Un paquet qui franchit la frontière d'un nœud arrive masqué derrière
+# l'adresse `flannel.1` du nœud d'où il part — 10.42.0.0 pour homa-eu-1,
+# 10.42.1.0 pour homa-eu-2 (flannel donne à `flannel.1` l'adresse .0 du sous-
+# réseau du nœud). Ce masquage a lieu AVANT que la NetworkPolicy ne regarde le
+# paquet : elle ne voit jamais l'adresse du pod émetteur, seulement celle d'un
+# nœud. Or un `namespaceSelector` n'est qu'une façon de nommer un ensemble
+# d'adresses de pods — il ne peut structurellement pas reconnaître une source
+# dont l'adresse de pod a déjà disparu.
 #
-# La règle est fail-closed par construction : un Ingress vide interdirait tout,
-# et ce qui n'est pas nommé ici n'entre pas.
+# Le Traefik qui sert la requête publique est celui d'eu-1 ; le pod est sur
+# eu-2 ; ses paquets arrivent donc sous 10.42.0.0, la règle ne les reconnaît
+# pas, et le connecteur rend 502. Rien d'autre n'est en cause.
+#
+# ---------------------------------------------------------------------------
+# LE PIÈGE DE MESURE, celui qui a fait perdre le plus de temps
+# ---------------------------------------------------------------------------
+#
+# Demander à l'application quelle adresse source elle voit ne répond PAS à la
+# question. Mesuré : un pod témoin qui imprime son `client_address` rend
+# `10.42.1.1` — la passerelle `cni0` du nœud de destination — pour TOUTES les
+# provenances, même un pod du même nœud. On en conclurait que le masquage efface
+# tout, donc qu'aucun `namespaceSelector` ne peut jamais marcher. C'est faux.
+#
+# Les deux ne voient pas le même paquet : la policy est appliquée dans la chaîne
+# `filter/FORWARD`, qui passe AVANT le `nat/POSTROUTING` qui réécrit la source
+# pour la livraison. La policy voit donc l'adresse de pod réelle quand elle
+# existe encore (même nœud) ; l'application, elle, voit toujours la passerelle.
+#
+# La seule instrumentation qui répond à la question est la policy elle-même :
+# on pose une règle, on regarde qui passe. C'est ce que fait le tableau ci-
+# dessous, et c'est la seule façon.
+#
+# ---------------------------------------------------------------------------
+# L'autre piège : le bassin de connexions — et comment ne plus le payer
+# ---------------------------------------------------------------------------
+#
+# Traefik garde des connexions ouvertes vers le backend. Une connexion déjà
+# établie survit à l'application d'une policy — le suivi de connexions la laisse
+# passer — donc une mesure prise juste après un `kubectl apply` lit l'état
+# PRÉCÉDENT. C'est ce qui a fait rendre 200 à trois plages d'adresses disjointes
+# d'affilée, lors de la première tentative. La parade connue coûtait cher :
+# poser `ingress: []`, se taire 125 s (se taire est la partie qui compte —
+# interroger le service pour vérifier qu'il est coupé relance le compte à
+# rebours d'inactivité), puis seulement poser la règle à mesurer. Dix minutes
+# par ligne de tableau, et le service coupé pendant ce temps.
+#
+# Le tableau ci-dessous a été pris autrement, et c'est reproductible en une
+# soirée : le témoin répond en **HTTP/1.0**. Traefik ferme alors la connexion
+# amont après chaque réponse, il n'y a plus de bassin à vider, et huit secondes
+# suffisent entre le `kubectl apply` et la mesure. Le contrôle le prouve :
+# `ingress: []` mord immédiatement.
+#
+# ---------------------------------------------------------------------------
+# Les mesures, le 2026-08-31, SANS toucher au connecteur
+# ---------------------------------------------------------------------------
+#
+# Aucune de ces lignes n'a coupé la production. Elles ont été prises sur un pod
+# témoin jetable du même namespace, portant sa propre étiquette, visé par sa
+# propre policy, et branché derrière le vrai Traefik par un Ingress temporaire :
+# la topologie du connecteur, à l'identique, mais sans le connecteur.
+#
+# « ext » = requête HTTPS publique sur domaines.ephais.eu, donc par eu-1.
+# « voisin eu-N » = un pod du namespace `default`, sur le nœud N, qui vise le
+# port 8080 du témoin en direct.
+#
+#   témoin sur homa-eu-2 (là où tourne le connecteur aujourd'hui)
+#   règle « from »                                 ext    voisin eu-1  voisin eu-2
+#   ---------------------------------------------  -----  -----------  -----------
+#   (aucune policy)                                200    passe        passe
+#   ingress: []                                    502    bloqué       bloqué
+#   namespaceSelector kube-system  ← la règle ci-dessous
+#                                                  502    bloqué       bloqué
+#   ipBlock 10.42.0.246/32  (le POD Traefik d'eu-1) 502   bloqué       bloqué
+#   ipBlock 10.42.1.1/32    (cni0, vu par l'appli)  502   bloqué       bloqué
+#   ipBlock 10.0.1.10/32    (IP interne d'eu-1)     502   bloqué       bloqué
+#   ipBlock 95.217.21.250/32 (IP publique d'eu-1)   502   bloqué       bloqué
+#   ipBlock 10.42.1.0/32    (flannel.1 d'eu-2)      502   bloqué       bloqué
+#   ipBlock 10.42.0.0/32    (flannel.1 d'eu-1)      200   PASSE        bloqué
+#   nsSelector + les DEUX flannel.1                 200   PASSE        bloqué
+#
+#   témoin sur homa-eu-1 (le nœud par lequel entre le trafic public)
+#   namespaceSelector kube-system  ← la MÊME règle    200  bloqué      bloqué
+#
+# Trois lignes tranchent :
+#
+#   — l'adresse du POD Traefik ne passe pas, celle de son NŒUD passe : la source
+#     que voit la policy est bien un nœud, pas un pod. La cause est là, et nulle
+#     part ailleurs. Aucune des adresses « voisines » plausibles (IP interne du
+#     nœud, IP publique, cni0) ne passe : ce n'est pas un tâtonnement heureux.
+#
+#   — ouvrir 10.42.0.0/32 fait entrer AVEC Traefik n'importe quel pod d'eu-1, de
+#     n'importe quel namespace. Ce n'est pas une identité, c'est un nœud entier.
+#     La variante « nsSelector + les deux flannel.1 », qui a le mérite de rendre
+#     200 quel que soit le placement, a exactement le même défaut : elle rend
+#     200 en laissant entrer le voisin. Un garde-fou qui laisse passer ce qu'il
+#     prétend arrêter n'en est pas un ; c'est le piège le plus tentant du lot,
+#     parce qu'il a l'air de marcher.
+#
+#   — la dernière ligne est la preuve demandée : la règle ci-dessous, sans
+#     modification, rend 200 depuis l'extérieur ET tient dehors les deux pods
+#     voisins, un sur chaque nœud, dans un autre namespace. Elle marche. Sa
+#     seule exigence est que le pod tourne sur le nœud par lequel entre
+#     l'adresse publique.
+#
+# ---------------------------------------------------------------------------
+# Pourquoi on ne l'applique pas quand même
+# ---------------------------------------------------------------------------
+#
+# Parce que cette exigence-là, on n'a pas le droit de la tenir.
+#
+# La plateforme refuse à l'admission tout pod qui nomme son nœud
+# (ValidatingAdmissionPolicy `tenant-no-nodename`), et le dit sans ambiguïté :
+# « Pinning a pod to a node is not available. Placement is the platform's job:
+# the scheduler spreads workloads and keeps a node's failure from taking
+# everything with it. » Un `nodeSelector` passerait encore — la règle ne vise
+# que `spec.nodeName` — mais ce serait franchir par la porte de service une
+# décision prise à la porte d'entrée.
+#
+# Et la porte de service donne sur le vide : le pod épinglé sur homa-eu-1, une
+# vidange de ce nœud le rend non ordonnançable, et l'enregistrement A de
+# domaines.ephais.eu — qui n'est pas dans notre main — le déplacerait tout
+# autant. Dans les deux cas le connecteur tombe en silence, sans que rien n'ait
+# changé de visible. Un garde-fou dont la panne ressemble à la panne qu'il
+# prétend empêcher n'en est pas un.
+#
+# Reste ce qu'il devait fermer : joindre le pod sur 8080 sans passer par
+# Traefik, et atteindre ainsi /authorize, la page qui émet les codes
+# d'autorisation. Ce trou-là est désormais fermé DANS L'APPLICATION, par la
+# marque que seul le proxy sait produire (dette D1, voir k8s/networking.yaml).
+# La différence n'est pas de degré : cette policy retirait le chemin — et un
+# ré-ordonnancement le rendait — tandis que la marque retire la faille, quel que
+# soit le nœud, quel que soit le voisin, et sans rien devoir au placement.
+#
+# Le fichier reste ici, non appliqué, parce qu'un manifeste effacé emporte le
+# diagnostic avec lui. `deploy.sh` ne l'applique pas, et dit pourquoi.
+#
+# Si un jour on veut la reprendre : le protocole de mesure est ci-dessus, le
+# témoin en HTTP/1.0 est ce qui le rend abordable, et la question à rouvrir
+# n'est pas « quelle règle » — elle est écrite et prouvée — mais « le connecteur
+# peut-il légitimement vivre sur le nœud d'entrée ».
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -31,20 +181,16 @@ spec:
       app: infomaniak-domains
   policyTypes: ["Ingress"]
   ingress:
-    # Traefik, quel que soit le namespace où la plateforme le range : on vise
-    # par étiquette, pas par nom d'espace, qui n'est pas garanti.
+    # Traefik, visé par étiquette de namespace et non par nom d'espace, qui
+    # n'est pas garanti. L'ipBlock 10.0.0.0/16 qui accompagnait cette règle a
+    # été retiré : il reposait sur l'idée que le trafic arrivait sous l'IP
+    # interne du nœud, ce que la mesure a réfuté. Une règle inutile qu'on
+    # garde « au cas où » est une règle dont personne ne sait plus ce qu'elle
+    # ouvre.
     - from:
-        # Par namespace, quand le CNI voit l'adresse du pod source.
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
-        # Et par adresse de nœud : mesuré le 2026-08-31, le trafic de Traefik
-        # arrive ici masqué derrière l'IP du nœud, donc le sélecteur de
-        # namespace seul ne le reconnaît pas et rend un 502. Le réseau des pods
-        # (10.42.0.0/16) reste hors de cette plage : les autres tenants sont
-        # toujours tenus dehors, ce qui est tout l'objet de cette policy.
-        - ipBlock:
-            cidr: 10.0.0.0/16
       ports:
         - port: 8080
           protocol: TCP

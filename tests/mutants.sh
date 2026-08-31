@@ -2,28 +2,74 @@
 # Abîme délibérément le code, une fois par mutant, et exige que la suite vire au
 # rouge. Un mutant qui survit nomme un trou dans les tests.
 #
-# ⚠️ Un SIGKILL court-circuite le trap : le mutant reste alors appliqué dans
-# l'arbre. C'est arrivé le 2026-08-30. Si une exécution est tuée de force,
-# faire `git checkout -- infomaniak_mcp.py` avant toute autre chose — et n'y
-# recourir qu'après un SIGTERM resté sans effet.
+# TROIS fichiers sont mutés, et c'est le second audit qui l'a imposé : le
+# harnais ne visait qu'`infomaniak_mcp.py`, si bien que `serveur.py` — le
+# serveur d'autorisation, exposé sur Internet, celui dont une faille coûte des
+# domaines — n'était éprouvé par AUCUN mutant. Les tests qui le couvrent
+# existaient ; rien ne disait qu'ils mordaient.
 #
-# ⚠️ La restauration se fait par `git checkout`, donc depuis l'index : ne jamais
-# lancer ce script sur un travail non commité, sous peine d'effacer le travail
-# et non le mutant. Le garde ci-dessous refuse de démarrer dans ce cas, et le
-# trap restaure quoi qu'il arrive — interruption comprise.
+# ⚠️ La restauration se fait depuis une COPIE prise au démarrage, plus depuis
+# `git checkout`. La raison est celle-là même qui interdisait de lancer ce
+# script sur du travail non commité : restaurer depuis l'index efface le
+# correctif au lieu du mutant. Une copie, elle, rend exactement ce qui était là
+# — commité ou non. Le garde qui refusait de démarrer disparaît donc avec sa
+# cause.
+#
+# ⚠️ Un SIGKILL court-circuite quand même le trap : le mutant resterait appliqué.
+# C'est arrivé le 2026-08-30. La copie est laissée sur le disque et son chemin
+# est affiché au démarrage — c'est de là qu'on restaure, à la main, si une
+# exécution est tuée de force. N'y recourir qu'après un SIGTERM resté sans effet.
+#
+# ⚠️ Ce script ÉCRIT dans les fichiers du dépôt. Deux agents qui travaillent en
+# parallèle sur les mêmes fichiers se marcheraient dessus : avant chaque
+# mutation, on vérifie que la cible est bien celle qu'on a copiée. Si elle a
+# changé sous nos pieds, on s'arrête SANS restaurer — le travail de l'autre
+# vaut mieux que notre copie périmée.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# Les fichiers que ce harnais a le droit d'abîmer. `CIBLE` désigne celui que
+# les mutants suivants visent ; il change en cours de route.
+CIBLES=(infomaniak_mcp.py serveur.py tests/run.sh)
 CIBLE=infomaniak_mcp.py
 
-if ! git diff --quiet -- "$CIBLE" || ! git diff --cached --quiet -- "$CIBLE"; then
-  echo "REFUS : $CIBLE a des modifications non commitées."
-  echo "Commiter le vert d'abord — sinon la restauration efface le correctif."
-  exit 2
-fi
+# `./tests/mutants.sh serveur.py` ne mute que ce fichier-là. Sans argument, on
+# les mute tous — c'est le seul mode qui rend un verdict sur le dépôt. Le
+# filtre sert à itérer sur un fichier, et à ne pas écrire dans celui qu'un
+# autre agent tient en main.
+FILTRE="${1:-}"
 
-restaure() { git checkout -- "$CIBLE" 2>/dev/null; }
-trap restaure EXIT INT TERM
+# La sonde de frontière interroge un hôte distant. Ici on la coupe : ce harnais
+# mesure si les tests LOCAUX mordent, et la réponse d'une production qu'aucun
+# mutant ne touche n'est pas ce signal-là. Même raison qu'`INFOMANIAK_RATE`
+# dans run.sh — deux signaux distincts ne doivent pas se confondre.
+export INFOMANIAK_FRONTIERE=-
+
+SAUVE="$(mktemp -d -t mutants-sauvegarde)"
+for f in "${CIBLES[@]}"; do
+  mkdir -p "$SAUVE/$(dirname "$f")"
+  cp -p "$f" "$SAUVE/$f" || { echo "REFUS : $f est illisible."; exit 2; }
+done
+echo "sauvegarde des cibles : $SAUVE"
+
+restaure() {
+  local f
+  for f in "${CIBLES[@]}"; do
+    cp -p "$SAUVE/$f" "$f" 2>/dev/null
+  done
+}
+
+# La copie ne survit qu'aux sorties qui court-circuitent le trap — c'est-à-dire
+# au SIGKILL, le seul cas où elle sert. Une sortie ordinaire, même interrompue,
+# a déjà restauré : garder la copie n'apporterait qu'un répertoire de plus dans
+# /tmp, et un répertoire de plus à chaque exécution.
+sortir() { restaure; rm -rf "$SAUVE"; }
+trap sortir EXIT INT TERM
+
+# Personne d'autre n'a-t-il écrit dans la cible pendant qu'on tournait ?
+intacte() {
+  cmp -s "$SAUVE/$1" "$1"
+}
 
 survivants=0
 teste=0
@@ -34,7 +80,21 @@ teste=0
 # quand la même garde existe dans deux fonctions.
 mutant() {
   local nom="$1" avant="$2" apres="$3" rang="${4:-0}"
+  if [ -n "$FILTRE" ] && [ "$CIBLE" != "$FILTRE" ]; then
+    return
+  fi
   teste=$(( teste + 1 ))
+  # AVANT de restaurer, sinon la vérification porterait sur la copie qu'on
+  # vient d'écrire et ne dirait plus rien. Le mutant précédent a restauré en
+  # sortant : à cet instant, la cible DOIT être identique à la sauvegarde.
+  if ! intacte "$CIBLE"; then
+    echo
+    echo "ARRÊT : $CIBLE a changé depuis le démarrage, et pas par nous."
+    echo "Quelqu'un d'autre y écrit. On ne restaure pas : sa version reste."
+    echo "Notre copie de départ, si jamais : $SAUVE"
+    trap - EXIT INT TERM
+    exit 3
+  fi
   restaure
   python3 - "$CIBLE" "$avant" "$apres" "$rang" <<'PY' || { echo "  ?? $nom : motif introuvable"; survivants=$(( survivants + 1 )); return; }
 import sys, pathlib
@@ -246,8 +306,8 @@ mutant "l'appartenance accepte tout ce qui contient le nom" \
   '        if propre and propre in nom:'
 
 mutant "la liste des domaines n'est plus bornee au compte" \
-  '        "account_id": args.get("account") or compte_epingle(),' \
-  '        "account_id": args.get("account"),'
+  $'        "account_id": compte_par_defaut(args.get("account")) if (\n            args.get("account") or compte_epingle()) else None,' \
+  $'        "account_id": args.get("account"),'
 
 mutant "l'epinglage ne normalise plus les espaces" \
   '    return os.environ.get("INFOMANIAK_ACCOUNT", "").strip() or None' \
@@ -261,6 +321,205 @@ mutant "une commande ne perime plus la liste d'appartenance" \
   '    _DOMAINES_DU_COMPTE.pop(str(compte), None)' \
   '    pass'
 
+# La cloison lecture/écriture du connecteur se déduit d'une MARQUE en tête de
+# description : `portee_outil()`, dans serveur.py, ne voit rien d'autre. La
+# renommer ici ferait basculer tous les outils du côté lecture, en silence, et
+# un jeton de lecture pourrait alors demander une écriture. C'est la dette D11 ;
+# `check_durcissement.py` la garde en exigeant les deux ensembles nommés.
+
+mutant "la marque d'ecriture est renommee dans les descriptions" \
+  'marque = "[DÉPENSE] " if depense else ("[écrit] " if ecrit else "")' \
+  'marque = "[depense] " if depense else ("[ecrit] " if ecrit else "")'
+
+mutant "un outil d'ecriture n'est plus declare comme tel" \
+  'outil_serveurs_de_noms, ecrit=True' \
+  'outil_serveurs_de_noms'
+
+# --- la source de vérité se défend elle-même --------------------------------
+# `serveur.py` se garde des params malformés de son côté. Ça ne dit rien de
+# `handle()`, qui est aussi appelé sur stdio, où personne ne le protège.
+
+mutant "handle() reprend son 'or {}' sur params" \
+  $'    params = message.get("params")\n    params = params if isinstance(params, dict) else {}' \
+  $'    params = message.get("params") or {}\n    params = params'
+
+mutant "un nom d'outil non hachable retourne dans la table" \
+  '        outil = BY_NAME.get(nom) if isinstance(nom, str) else None' \
+  '        outil = BY_NAME.get(nom)'
+
+# ===========================================================================
+# serveur.py — le serveur d'autorisation, exposé sur Internet
+# ===========================================================================
+# Aucun mutant ne le visait jusqu'ici. Ses tests existaient, et rien ne disait
+# qu'ils mordaient : c'est exactement la situation qui a laissé passer six
+# failles au premier audit.
+
+CIBLE=serveur.py
+
+# --- le cadrage HTTP : ce qui décide où commence la requête suivante ---------
+
+mutant "Transfer-Encoding n'est plus refusé (désynchronisation CL.TE)" \
+  '        if self.headers.get_all("Transfer-Encoding"):' \
+  '        if False:'
+
+mutant "deux Content-Length contradictoires passent" \
+  '        if len(longueurs) > 1:' \
+  '        if False:'
+
+mutant "un Content-Length qui n'est pas un nombre d'octets passe" \
+  '        if longueurs and not re.fullmatch(r"[0-9]{1,15}", longueurs.pop()):' \
+  '        if False:'
+
+# --- la coupure doit être ANNONCÉE, pas seulement décidée -------------------
+
+mutant "la coupure n'est plus annoncée du tout" \
+  '        coupe = self.close_connection or self._corps_en_suspens()' \
+  '        coupe = False'
+
+mutant "le témoin de corps lu n'est pas remis à zéro entre deux requêtes" \
+  $'        self._debut_requete = time.monotonic()\n        self._corps_consomme = False' \
+  $'        self._debut_requete = time.monotonic()'
+
+mutant "un corps annoncé et non lu ne fait plus annoncer la coupure" \
+  '        coupe = self.close_connection or self._corps_en_suspens()' \
+  '        coupe = self.close_connection'
+
+# --- le slowloris : un budget de durée, pas un délai par recv ---------------
+
+mutant "le budget de lecture du corps devient une heure" \
+  '        echeance = getattr(self, "_debut_requete", time.monotonic()) + DELAI_CORPS' \
+  '        echeance = getattr(self, "_debut_requete", time.monotonic()) + 3600'
+
+mutant "le budget se réarme à chaque tranche (redevient un délai par recv)" \
+  '                reste = echeance - time.monotonic()' \
+  '                reste = DELAI_CORPS'
+
+mutant "le budget n'est plus borné, donc un réglage de zéro refuse tout corps" \
+  '    return min(60.0, max(1.0, voulu))' \
+  '    return voulu'
+
+# --- l'état ne doit plus enfler sans borne ----------------------------------
+
+mutant "la pierre tombale du rafraîchissement revit quatre-vingt-dix jours" \
+  '            entree["exp"] = min(peremption(entree, tombe), tombe)' \
+  '            entree["exp"] = peremption(entree, tombe)'
+
+mutant "révoquer ne pose plus de péremption sur l'autorisation" \
+  '        grant["exp"] = min(peremption(grant, fin), fin)' \
+  '        grant["exp"] = peremption(grant, fin)'
+
+mutant "les autorisations périmées ne sont plus retirées" \
+  $'        if fin > now:\n            grants[gid] = grant' \
+  $'        if True:\n            grants[gid] = grant'
+
+mutant "un état sans péremption est jeté au lieu d'être réparé" \
+  '        if not fin:' \
+  '        if False:'
+
+# --- une lecture n'est pas une écriture -------------------------------------
+
+mutant "l'horodatage d'activité est réécrit à chaque requête" \
+  '                if maintenant - dernier >= ACTIVITE_PAS:' \
+  '                if True:'
+
+mutant "l'état est persisté même quand rien n'a changé" \
+  $'            if change:\n                oauth_save(data)\n        return set(' \
+  $'            if True:\n                oauth_save(data)\n        return set('
+
+# --- la page d'accueil et le jeton de révocation de Vincent -----------------
+
+mutant "la page d'accueil perd son contrôle de navigation" \
+  $'        refus = self._exige_navigation()\n        if refus is not None:\n            return refus\n        csrf = jeton()' \
+  $'        csrf = jeton()'
+
+mutant "/authorize perd son contrôle de navigation" \
+  $'        refus = self._exige_navigation()\n        if refus is not None:\n            return refus\n\n        q = self._query_stricte()' \
+  $'        q = self._query_stricte()'
+
+mutant "le contrôle de navigation ne regarde plus la destination" \
+  '        if (dest and dest != "document") or (mode and mode != "navigate"):' \
+  '        if False:'
+
+# --- une seule prise de verrou ---------------------------------------------
+
+mutant "l'échange du code prend le verrou en deux fois" \
+  $'        with _oauth_lock:\n            data, retire = oauth_frais()\n            entree = data["codes"].get(empreinte(code))' \
+  $'        with _oauth_lock:\n            data, retire = oauth_frais()\n        with _oauth_lock:\n            entree = data["codes"].get(empreinte(code))'
+
+# --- /consent ne lit rien de son corps --------------------------------------
+
+mutant "/consent relit le code_challenge depuis le formulaire" \
+  '                "code_challenge": demande["code_challenge"], "scope": demande["scope"],' \
+  '                "code_challenge": form.get("code_challenge") or demande["code_challenge"], "scope": demande["scope"],'
+
+mutant "/consent relit l'adresse de retour depuis le formulaire" \
+  '            reponse = demande["redirect_uri"] + joint + urlencode(champs)' \
+  '            reponse = (form.get("redirect_uri") or demande["redirect_uri"]) + joint + urlencode(champs)'
+
+mutant "/consent relit la portée depuis le formulaire" \
+  '                "code_challenge": demande["code_challenge"], "scope": demande["scope"],' \
+  '                "code_challenge": demande["code_challenge"], "scope": form.get("scope") or demande["scope"],'
+
+# --- un code non persisté ne doit pas être émis -----------------------------
+
+mutant "/consent émet un code que le volume n'a pas gardé" \
+  $'            durable = oauth_save(data)\n            if durable:' \
+  $'            durable = oauth_save(data) or True\n            if durable:'
+
+mutant "/token délivre une paire que le volume n'a pas gardée" \
+  $'        if not durable:\n            return self._json(500, {"error": "server_error"})\n        return self._json(200, {"access_token": acces, "token_type": "Bearer",\n                                "expires_in": ACCESS_TTL, "refresh_token": rafraichir,' \
+  $'        if False:\n            return self._json(500, {"error": "server_error"})\n        return self._json(200, {"access_token": acces, "token_type": "Bearer",\n                                "expires_in": ACCESS_TTL, "refresh_token": rafraichir,'
+
+mutant "/authorize affiche une demande qu'il n'a pas enregistrée" \
+  $'            durable = oauth_save(data)\n        if not durable:\n            return self._send(500, page_refus(' \
+  $'            durable = oauth_save(data) or True\n        if not durable:\n            return self._send(500, page_refus('
+
+# --- les péremptions ---------------------------------------------------------
+
+mutant "un code d'autorisation vit un an" \
+  'CODE_TTL = 300' \
+  'CODE_TTL = 31536000'
+
+mutant "les codes échappent au ménage" \
+  '    for cle in ("pending", "codes", "access", "refresh"):' \
+  '    for cle in ("pending", "access", "refresh"):'
+
+# --- l'audience : le contrôle qui était une tautologie ----------------------
+
+mutant "l'audience du jeton est reconstruite depuis la configuration" \
+  '            "grant_id": grant_id, "scope": scope, "aud": aud,' \
+  '            "grant_id": grant_id, "scope": scope, "aud": MCP_URL,'
+
+mutant "l'audience du code n'est plus lue dans l'autorisation" \
+  '                entree.get("resource") or MCP_URL)' \
+  '                MCP_URL)'
+
+mutant "la rotation ne transporte plus l'audience" \
+  '                                        entree.get("aud") or MCP_URL,' \
+  '                                        MCP_URL,'
+
+mutant "le contrôle d'audience disparaît" \
+  '            if entree.get("aud") != MCP_URL:' \
+  '            if False:'
+
+# ===========================================================================
+# tests/run.sh — le lanceur lui-même
+# ===========================================================================
+# `check_frontiere.sh` a existé des semaines sans que personne ne le lance. Un
+# test qu'on ne lance pas n'est pas un test, c'est un fichier — et rien, dans
+# la suite, ne s'en apercevait.
+
+CIBLE=tests/run.sh
+
+mutant "run.sh cesse de lancer la sonde de frontière" \
+  '  sortie=$(./tests/check_frontiere.sh "$HOTE_FRONTIERE" 2>&1); verdict=$?' \
+  '  sortie="(sonde desactivee)"; verdict=0'
+
 echo
-echo "$teste mutants, $survivants survivant(s)"
+if [ -n "$FILTRE" ]; then
+  echo "$teste mutants sur $FILTRE seulement, $survivants survivant(s)"
+  echo "(verdict PARTIEL : sans argument, le harnais mute les trois cibles)"
+else
+  echo "$teste mutants, $survivants survivant(s)"
+fi
 [ "$survivants" -eq 0 ]

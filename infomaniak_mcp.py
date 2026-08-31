@@ -1040,10 +1040,21 @@ def instructions():
 
 
 def handle(message):
-    """Rend la réponse à envoyer, ou None pour une notification."""
+    """Rend la réponse à envoyer, ou None pour une notification.
+
+    `params` est réduit à un objet, et à rien d'autre. `or {}` gardait tout ce
+    qui est VRAI : une liste, une chaîne, un nombre passaient, et le
+    `params.get()` de la ligne suivante levait un AttributeError. Sur stdio,
+    l'exception remonte à `main()` qui la rend en erreur JSON-RPC ; sur le
+    transport HTTP, elle partait AVANT le contrôle de portée, donc un contrôle
+    qu'un paramètre mal formé fait sauter. `serveur.py` s'en garde de son côté,
+    mais un garde-fou posé chez l'appelant ne protège que cet appelant-là : la
+    source de vérité des outils doit se défendre elle-même.
+    """
     methode = message.get("method")
     mid = message.get("id")
-    params = message.get("params") or {}
+    params = message.get("params")
+    params = params if isinstance(params, dict) else {}
 
     if methode == "initialize":
         demande = params.get("protocolVersion")
@@ -1063,7 +1074,10 @@ def handle(message):
 
     if methode == "tools/call":
         nom = params.get("name")
-        outil = BY_NAME.get(nom)
+        # `BY_NAME.get(nom)` LÈVE sur un nom non hachable — une liste, un objet.
+        # Un nom qui n'est pas une chaîne ne peut désigner aucun outil : on le
+        # dit, plutôt que de laisser TypeError sortir d'une table de hachage.
+        outil = BY_NAME.get(nom) if isinstance(nom, str) else None
         if not outil:
             return result("Cet outil n'existe pas : %r. Outils disponibles : %s."
                           % (nom, ", ".join(sorted(BY_NAME))), True)

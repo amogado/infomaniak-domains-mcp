@@ -86,6 +86,26 @@ spec:
                   # un fichier ni une sortie lisible : voir deploy.sh.
                   name: infomaniak-token
                   key: token
+            # La marque du proxy (dette D1). Le MÊME Secret alimente le
+            # Middleware Traefik qui pose l'en-tête `X-Infomaniak-Proxy` :
+            # `deploy.sh` l'y rend depuis cette clé-ci. Deux sources auraient
+            # produit, au premier écart, un serveur qui refuse TOUT LE MONDE
+            # sans qu'aucun test ne vire au rouge — aucun test du dépôt ne parle
+            # à la fois au proxy et au serveur.
+            #
+            # Absente, cette variable ne dégrade pas vers l'ouvert :
+            # `_humain_present()` retombe sur la boucle locale, c'est-à-dire sur
+            # personne derrière un proxy. Le connecteur devient visiblement
+            # inutilisable plutôt que silencieusement ouvert, et le serveur
+            # l'annonce en première ligne de journal. `deploy.sh` refuse de
+            # déployer sans ce Secret, pour que cette ligne ne serve jamais.
+            - name: INFOMANIAK_MARQUE_PROXY
+              valueFrom:
+                secretKeyRef:
+                  # Secret HORS DÉPÔT. Sa création — la valeur n'est lue par
+                  # personne, pas même par Vincent : voir deploy.sh.
+                  name: infomaniak-marque-proxy
+                  key: marque
             - name: INFOMANIAK_LISTEN_PORT
               value: "8080"
             # La racine est en lecture seule : sans HOME habitable, une routine

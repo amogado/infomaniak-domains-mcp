@@ -59,6 +59,7 @@ sys.path.insert(0, str(RACINE / "tests"))
 
 import faux_api                                            # noqa: E402
 import infomaniak_mcp as ik                                # noqa: E402
+import marque_proxy                                        # noqa: E402
 
 REDIRECT = "https://claude.ai/api/mcp/auth_callback"
 BASIC = "Basic " + base64.b64encode(b"vincent:secret").decode()
@@ -128,6 +129,11 @@ ENV.update({
     "INFOMANIAK_RATE": "1000000",
     "PYTHONUNBUFFERED": "1",
 })
+# La marque du proxy, POSÉE : sans elle, le serveur retombe sur son exception
+# de boucle locale et cette suite n'emprunterait jamais la frontière humaine
+# telle que la production la tient. Un banc qui contourne le garde-fou qu'il
+# est censé traverser ne dit rien de la production.
+ENV.update(marque_proxy.env())
 # Désarmés, comme en production : les armer se décide, ne se subit pas.
 for arme in ("INFOMANIAK_WRITE", "INFOMANIAK_ACHAT", "INFOMANIAK_TOKEN_CMD"):
     ENV.pop(arme, None)
@@ -315,7 +321,7 @@ def csrf_de(html):
     return trouve.group(1) if trouve else ""
 
 
-HUMAIN = {}             # rempli à la première sonde : {} ou {"Authorization": BASIC}
+HUMAIN = {}             # rempli à la première sonde — voir `marque_proxy`
 
 
 def regime_humain(chemin):
@@ -435,7 +441,15 @@ try:
         # sans l'autre laisserait l'autorisation à la portée de n'importe qui.
         regime_page = regime_humain("/")
         if regime_page:
-            HUMAIN["Authorization"] = BASIC
+            # Comment on entre se CONSTATE aussi : la marque du proxy depuis
+            # D1, le Basic avant elle. Deviner le nom en dur ferait virer au
+            # rouge un correctif juste — c'est la valeur qui protège, jamais le
+            # nom de l'en-tête, qu'un inconnu peut écrire de toute façon.
+            HUMAIN.update(marque_proxy.trouver(lambda t: get("/", t)[0] == 200)
+                          or dict(marque_proxy.ANCIEN_REGIME))
+        # Ce qu'un navigateur pose sur une vraie navigation : depuis D9,
+        # /authorize refuse ce qui n'en est pas une.
+        HUMAIN.update(marque_proxy.navigation())
         print("   régime humain constaté : %s"
               % ("identifiants exigés par l'application"
                  if regime_page else "frontière hors application"))

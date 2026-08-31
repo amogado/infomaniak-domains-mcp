@@ -48,7 +48,62 @@ spec:
     secret: infomaniak-domains-basicauth
     realm: domaines
 ---
-# L'Ingress humain : tout le reste du site, derrière Basic Auth.
+# ---------------------------------------------------------------------------
+# La marque du proxy — le second middleware de l'Ingress humain (dette D1)
+# ---------------------------------------------------------------------------
+#
+# Le Basic Auth prouve « ce navigateur détient le mot de passe ». Il ne prouve
+# RIEN sur le chemin emprunté : le pod écoute sur 8080, et tout voisin du
+# cluster atteignait /authorize — la page qui émet les codes d'autorisation —
+# en le joignant en direct, sans jamais croiser Traefik. `Authorization: Basic`
+# et `X-Forwarded-User`, sur lesquels s'appuyait `_humain_present()`, sont des
+# en-têtes que l'appelant écrit lui-même.
+#
+# `serveur.py` compare désormais `X-Infomaniak-Proxy` à `INFOMANIAK_MARQUE_PROXY`
+# par `hmac.compare_digest`, et n'accepte QU'UNE occurrence. Ce middleware est
+# ce qui produit la marque, et il n'est posé QUE sur l'Ingress humain.
+#
+# L'objet Middleware lui-même n'est pas dans ce fichier, et ce n'est pas un
+# oubli : `customRequestHeaders` ne prend qu'une valeur littérale — Traefik ne
+# sait pas lire un Secret pour un en-tête. L'écrire ici mettrait le secret
+# partagé dans le dépôt, donc hors d'atteinte de toute rotation. Il est rendu au
+# déploiement par `k8s/marque_middleware.py`, depuis le Secret
+# `infomaniak-marque-proxy` (clé « marque »), hors dépôt — le MÊME Secret que
+# `k8s/deployment.yaml` injecte au conteneur. Une seule source pour les deux
+# côtés : ils ne peuvent pas diverger, et tourner la marque la tourne des deux
+# côtés à la fois.
+#
+# CE QUE customRequestHeaders FAIT DE LA COPIE ENTRANTE : il l'ÉCRASE.
+# Vérifié dans la source de Traefik (`pkg/middlewares/headers/header.go`, v3.6 :
+# `req.Header.Set(header, value)` — `Set` remplace toutes les valeurs, là où
+# `Add` en ajouterait une), confirmé par la documentation (« Custom headers will
+# overwrite existing headers if they have identical names »), et MESURÉ contre
+# le Traefik 3.6.25 de ce cluster le 2026-08-31, sur un pod témoin qui rend les
+# occurrences reçues :
+#
+#   ce que le client envoie          derrière ce middleware   sans middleware
+#   -------------------------------  -----------------------  ----------------
+#   rien                             1 × la vraie valeur      0 occurrence
+#   X-Infomaniak-Proxy: forgé        1 × la vraie valeur      1 × « forgé »
+#   deux fois l'en-tête, forgé       1 × la vraie valeur      2 occurrences
+#   la vraie valeur, devinée         1 × la vraie valeur      1 occurrence
+#
+# La colonne de droite est ce qui rend nécessaire le refus du doublon côté
+# serveur : un client PEUT envoyer deux occurrences. Traefik les réduit à une —
+# mais si une version future ajoutait au lieu d'écraser, `serveur.py` refuserait
+# la requête (len != 1) au lieu de lire la copie hostile arrivée en tête. La
+# mauvaise configuration se verrait ; elle ne s'exploiterait pas.
+#
+# ORDRE DES MIDDLEWARES : `-auth` d'abord, `-marque` ensuite. Traefik les
+# applique dans l'ordre de la liste : une requête sans mot de passe est renvoyée
+# par le Basic Auth avant que la marque ne soit posée. L'inverse fonctionnerait
+# aussi, mais poserait la marque sur des requêtes qu'on s'apprête à refuser.
+#
+# SI LE MIDDLEWARE MANQUE : Traefik rend 500 sur les routes humaines. C'est
+# fail-closed, et c'est voulu — appliquer ce fichier à la main sans passer par
+# `deploy.sh` ferme le site, il ne l'ouvre pas sans marque.
+# ---------------------------------------------------------------------------
+# L'Ingress humain : tout le reste du site, derrière Basic Auth ET la marque.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -58,7 +113,7 @@ metadata:
     # sur un même hôte font deux commandes Let's Encrypt pour un seul
     # certificat, donc deux fois le quota pour rien.
     cert-manager.io/issuer: letsencrypt
-    traefik.ingress.kubernetes.io/router.middlewares: infomaniak-domains-default-infomaniak-domains-auth@kubernetescrd
+    traefik.ingress.kubernetes.io/router.middlewares: infomaniak-domains-default-infomaniak-domains-auth@kubernetescrd,infomaniak-domains-default-infomaniak-domains-marque@kubernetescrd
 spec:
   ingressClassName: traefik
   tls:
@@ -84,6 +139,13 @@ spec:
 # le cloud, SANS identifiants Basic. Ces sept chemins — et EUX SEULS — sortent
 # donc du middleware d'authentification. Tout le reste (/, /authorize,
 # /consent, /healthz) reste derrière.
+#
+# Un huitième chemin s'y ajoute, pour une raison différente : /_whoami sert
+# l'empreinte du code effectivement chargé. Une empreinte qu'on ne peut lire
+# qu'avec le mot de passe est une empreinte lue de l'intérieur — or c'est
+# précisément la vue du dehors qui peut mentir, et c'est elle qu'on veut
+# confronter au dépôt (dette D12). Il ne rend qu'un condensat : rien qui aide
+# à entrer, et tout ce qu'il faut pour savoir ce qui tourne.
 #
 # pathType: Exact, JAMAIS Prefix. Traefik traduit Prefix en PathPrefix(), qui
 # est un préfixe de CHAÎNE et non de segment : exempter « /mcp » en Prefix
@@ -118,6 +180,20 @@ metadata:
     # PAS de cert-manager.io/issuer ici : le certificat est commandé par
     # l'Ingress humain, sur le même hôte. PAS de -auth non plus : c'est tout
     # l'objet de cet Ingress.
+    #
+    # PAS de -marque non plus, et c'est la ligne la plus facile à ajouter par
+    # mégarde le jour où l'on copiera l'annotation d'à côté. Claude appelle ces
+    # huit chemins depuis le cloud, sans mot de passe : les marquer dirait « une
+    # présence humaine a traversé le proxy » d'un trafic qui n'a traversé aucune
+    # porte humaine. Aucun des huit ne consulte `_humain_present()` aujourd'hui
+    # — les quatre routes qui le font sont /, /authorize, /consent et /revoke,
+    # toutes servies par l'Ingress humain — donc rien ne s'ouvrirait ce matin.
+    # Ce qui s'ouvrirait, c'est plus tard : le jour où une route humaine
+    # déménage ici, ou qu'un de ces chemins gagne une vérification humaine, la
+    # marque aurait cessé de vouloir dire ce qu'elle dit, sans que rien ne
+    # bouge. `tests/check_frontiere.sh` ne peut pas voir ça du dehors — la
+    # marque est posée entre Traefik et le pod, invisible depuis Internet. Cette
+    # ligne-ci est la seule garde.
     traefik.ingress.kubernetes.io/router.middlewares: infomaniak-domains-default-infomaniak-domains-mcp-ratelimit@kubernetescrd,infomaniak-domains-default-infomaniak-domains-mcp-inflight@kubernetescrd
     # Priorité explicite : Traefik trie par longueur de règle, et l'écart entre
     # Path(/mcp) et PathPrefix(/) est trop serré pour qu'on lui confie la
@@ -155,5 +231,8 @@ spec:
             pathType: Exact
             backend: {service: {name: infomaniak-domains-direct, port: {number: 80}}}
           - path: /.well-known/openid-configuration
+            pathType: Exact
+            backend: {service: {name: infomaniak-domains-direct, port: {number: 80}}}
+          - path: /_whoami
             pathType: Exact
             backend: {service: {name: infomaniak-domains-direct, port: {number: 80}}}

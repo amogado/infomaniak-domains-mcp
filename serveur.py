@@ -25,6 +25,14 @@ Configuration propre à ce transport :
                              un code rejouable indéfiniment.
     INFOMANIAK_REDIRECTS     les adresses de retour acceptées, séparées par des
                              virgules. Égalité stricte, jamais de préfixe.
+    INFOMANIAK_MARQUE_PROXY  le secret partagé avec Traefik, sans lequel aucune
+                             page humaine ne s'ouvre. Le proxy le POSE et
+                             ÉCRASE toute copie entrante ; c'est ce qui rend la
+                             marque infalsifiable par l'appelant, là où un
+                             `Authorization: Basic` ou un `X-Forwarded-User`
+                             s'écrivent tout seuls. Absent, le serveur ne sert
+                             les pages humaines qu'à la boucle locale : voir
+                             `_humain_present()`.
 
 La configuration de l'API (jeton, compte épinglé, armements) est celle de
 `infomaniak_mcp` et n'est pas redite ici. Le jeton Infomaniak ne traverse
@@ -75,6 +83,14 @@ MCP_URL = PUBLIC_BASE + "/mcp"
 DATA_DIR = os.environ.get("INFOMANIAK_DATA", "/data")
 OAUTH_PATH = os.path.join(DATA_DIR, "oauth.json")
 
+# La marque que seul le proxy peut produire. Le nom de l'en-tête est une
+# constante du module pour qu'un test l'IMPORTE au lieu de le recopier : deux
+# orthographes de « X-Infomaniak-Proxy » — l'une ici, l'autre dans le
+# middleware — donneraient un serveur qui refuse tout le monde, et un test
+# vert.
+ENTETE_MARQUE = "X-Infomaniak-Proxy"
+MARQUE_PROXY = os.environ.get("INFOMANIAK_MARQUE_PROXY", "").strip()
+
 CLIENT_ID = "infomaniak-domains-claude"
 ALLOWED_REDIRECTS = tuple(
     x.strip() for x in os.environ.get(
@@ -91,21 +107,145 @@ CODE_TTL = 300             # un code d'autorisation
 REJEU_TTL = 300            # pendant lequel recharger la page rend la même réponse
 ACCESS_TTL = 3600          # un jeton d'accès
 REFRESH_TTL = 90 * 86400   # la chaîne de rafraîchissement, en absolu
+REVOKE_TTL = 900           # un jeton anti-CSRF de la page « Connecter Claude »
+
+# Ce que survit une PIERRE TOMBALE — une entrée gardée non pour servir, mais
+# pour reconnaître un rejeu. Un jeton de rafraîchissement tourné restait dans
+# l'état jusqu'à la fin de sa chaîne, c'est-à-dire quatre-vingt-dix jours :
+# chaque rotation laissait une pierre de plus, l'état enflait sans borne, et
+# comme le fichier vit sur le PVC, le pod finissait OOMKillé de façon
+# PERMANENTE — un redémarrage relit le même fichier, donc remeurt. Mesuré :
+# 300 rotations, 301 entrées.
+#
+# Une heure suffit à ce pour quoi la pierre existe : un client qui rejoue le
+# fait dans la seconde, pas le lendemain. Au-delà, l'entrée n'est plus une
+# détection de rejeu, c'est de l'encombrement — et un jeton présenté après sa
+# disparition est refusé de toute façon, faute d'être dans la table.
+TOMBE_TTL = 3600
+
+# Une autorisation vit tant que sa chaîne de rafraîchissement peut vivre. Elle
+# ne se périmait NULLE PART : `oauth_menage()` n'itérait que pending, codes,
+# access et refresh, et `oauth_revoquer()` marquait `revoked` sans jamais
+# retirer. `data["grants"]` n'était donc jamais purgée — le même défaut que la
+# table refresh, sur la seule table qui ne se vide pas d'elle-même.
+GRANT_TTL = REFRESH_TTL
+
+# L'horodatage de dernière activité d'une autorisation. Le rafraîchir à chaque
+# requête authentifiée réécrivait TOUT l'état à chaque `tools/list` — et même
+# sur un `GET /mcp` qui ne rend qu'un 405. C'est ce qui rendait létale la table
+# qui enflait : elle était réécrite en entier, sous le verrou global, à chaque
+# requête. Une minute de granularité suffit à répondre « quand ce connecteur
+# a-t-il servi pour la dernière fois ? ».
+ACTIVITE_PAS = 60
+
+# Le budget de durée TOTALE d'une lecture de corps, en secondes, compté depuis
+# le début de la requête. Le `timeout` de la classe est un délai PAR recv : un
+# octet toutes les vingt-neuf secondes tenait un thread indéfiniment, sans
+# jamais présenter d'identifiant, et ThreadingHTTPServer ne plafonne pas ses
+# threads. Un budget total, lui, ne se réarme pas. Réglable pour que les bancs
+# d'essai n'aient pas à attendre huit secondes pour constater qu'il existe, et
+# BORNÉ à [1 s, 60 s] : un réglage distrait — « 0 », « 999999 », « oui » — ne
+# doit ni supprimer le budget ni le rendre inutile. Une valeur illisible
+# retombe sur le défaut plutôt que d'empêcher le serveur de démarrer.
+def _delai_corps():
+    try:
+        voulu = float(os.environ.get("INFOMANIAK_DELAI_CORPS") or 8)
+    except ValueError:
+        voulu = 8.0
+    return min(60.0, max(1.0, voulu))
+
+
+DELAI_CORPS = _delai_corps()
+
+# Trois bornes, parce que trois tables grandissent sous la main d'un inconnu.
+# Un plafond bas est un choix : au-delà, ce n'est plus un humain qui autorise
+# des connecteurs, c'est quelqu'un qui inonde. Le dépassement évince la plus
+# ancienne entrée plutôt que de refuser la nouvelle — refuser donnerait à
+# l'inondeur exactement ce qu'il cherche, c'est-à-dire empêcher Vincent
+# d'autoriser Claude.
+PENDING_MAX = 64
+GRACE_MAX = 32
+REVOKE_MAX = 32
+# La quatrième : les autorisations abouties. Elle est haute parce que /consent
+# vit derrière la frontière humaine — la cadence y est celle d'un humain, pas
+# celle d'un inondeur. Elle existe quand même : une péremption borne l'état
+# dans le temps, un plafond le borne dans l'espace, et c'est le second qui
+# tient le jour où l'horloge du pod recule.
+GRANTS_MAX = 256
 
 _oauth_lock = threading.Lock()
 
-# Les sept chemins qui sortent de l'authentification humaine, énumérés ici pour
-# que le dépôt et l'Ingress se lisent l'un contre l'autre. Le serveur ne s'en
-# sert pas pour décider : c'est Traefik qui tient la frontière, en `pathType:
+# Deux réserves qui ne touchent JAMAIS le disque, et c'est toute leur raison
+# d'être. `empreinte()` promet qu'un fichier d'état volé ne donne aucun jeton
+# utilisable ; l'URL de réponse de la fenêtre de grâce, elle, porte le code en
+# clair, et un jeton anti-CSRF persisté serait un secret de plus sur le PVC
+# pour rien. Les perdre au redémarrage ne coûte qu'un rechargement de page —
+# un instantané du volume, lui, ne se rattrape pas.
+#
+# Le prix, à connaître : un second réplica ne les partagerait pas. Le
+# Deployment est à `replicas: 1` en `Recreate` ; le jour où ça change, la
+# fenêtre de grâce et le jeton de /revoke devront changer aussi.
+_grace = {}            # empreinte(csrf) -> {"reponse": url, "exp": …}
+_csrf_revoke = {}      # empreinte(jeton) -> {"exp": …}
+
+# Les chemins qui sortent de l'authentification humaine, énumérés ici pour que
+# le dépôt et l'Ingress se lisent l'un contre l'autre. Le serveur ne s'en sert
+# pas pour décider : c'est Traefik qui tient la frontière, en `pathType:
 # Exact`. `Prefix` s'y traduit par un préfixe de **chaîne**, donc exempter
 # « /mcp » exempterait aussi « /mcpXXX ».
+#
+# Les sept premiers sont ceux que Claude appelle depuis le cloud. `/_whoami`
+# est le huitième et n'a rien à voir avec OAuth : il sert l'empreinte du code
+# chargé, et il ne vaut que s'il répond à qui n'a PAS le mot de passe — voir
+# `_whoami()` pour ce qu'il montre et ce qu'il tait.
 CHEMINS_MACHINE = (
     "/mcp", "/token", "/register",
     "/.well-known/oauth-protected-resource",
     "/.well-known/oauth-protected-resource/mcp",
     "/.well-known/oauth-authorization-server",
     "/.well-known/openid-configuration",
+    "/_whoami",
 )
+
+# --------------------------------------------------------------------------
+# l'empreinte du code chargé
+# --------------------------------------------------------------------------
+
+# Calculée UNE FOIS, à l'import — pas à chaque requête, et pas par confort.
+# `/app` est un ConfigMap : son contenu se rafraîchit tout seul, sans rollout,
+# environ une minute après un `kubectl apply`. Relire les fichiers à chaque
+# requête annoncerait donc l'empreinte de ce qui est SUR LE DISQUE, quand la
+# question posée est « quel code ce processus exécute-t-il ? ». Lue à l'import,
+# elle date du moment où Python a chargé ces octets : c'est la seule lecture
+# qui réponde à la question.
+FICHIERS_CODE = ("serveur.py", "infomaniak_mcp.py")
+
+
+def _empreintes_du_code():
+    """L'empreinte de chaque fichier, plus une empreinte d'ensemble.
+
+    Par fichier et en SHA-256 brut, pour que la comparaison se fasse sans
+    outil : `git show HEAD:serveur.py | shasum -a 256` doit rendre la même
+    chaîne. Un condensé unique, lui, ne se compare qu'à un autre condensé du
+    même programme — et ne dit pas LEQUEL des deux fichiers a divergé.
+    """
+    dossier = os.path.dirname(os.path.abspath(__file__))
+    par_fichier = {}
+    for nom in FICHIERS_CODE:
+        try:
+            with open(os.path.join(dossier, nom), "rb") as fh:
+                par_fichier[nom] = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            # Un fichier illisible n'est pas « inchangé » : on le dit, plutôt
+            # que de servir une empreinte d'ensemble qui aurait l'air normale.
+            par_fichier[nom] = "illisible"
+    ensemble = hashlib.sha256(
+        "".join("%s:%s\n" % (nom, par_fichier[nom])
+                for nom in FICHIERS_CODE).encode("utf-8")).hexdigest()
+    return par_fichier, ensemble
+
+
+EMPREINTES_FICHIERS, EMPREINTE_CODE = _empreintes_du_code()
 
 
 # --------------------------------------------------------------------------
@@ -159,26 +299,141 @@ def oauth_save(data):
         return False
 
 
+def peremption(entree, defaut=0.0):
+    """La péremption d'une entrée, en secondes epoch, et jamais une exception.
+
+    L'état vient d'un fichier : une version d'avant a pu l'écrire, un
+    instantané a pu le tronquer, une main a pu l'éditer. Un `exp` absent,
+    nul, textuel ou négatif ne doit pas faire lever le ménage — sinon un seul
+    caractère de travers rend le serveur inutilisable, ce qui est pire que ce
+    qu'on cherchait à empêcher.
+    """
+    try:
+        return float(entree.get("exp") or defaut)
+    except (TypeError, ValueError):
+        return defaut
+
+
 def oauth_menage(data, maintenant=None):
-    """Écarte ce qui a expiré. Un code consommé est GARDÉ jusqu'à sa péremption :
-    c'est ce qui permet de DÉTECTER un rejeu au lieu de le confondre avec un
-    code inconnu — et un rejeu confondu avec une erreur banale ne révoquerait
-    rien."""
+    """Écarte ce qui a expiré, et rend le NOMBRE de changements apportés.
+
+    Un code consommé est GARDÉ jusqu'à sa péremption : c'est ce qui permet de
+    DÉTECTER un rejeu au lieu de le confondre avec un code inconnu — et un
+    rejeu confondu avec une erreur banale ne révoquerait rien.
+
+    Le compte rendu n'est pas décoratif. `/token` est l'un des chemins sortis
+    de l'authentification : n'importe qui l'atteint, et six chemins de refus
+    persistaient l'état sans que rien n'ait changé — une réécriture complète du
+    PVC par requête anonyme, sous le verrou global que `/mcp` doit prendre pour
+    valider le moindre Bearer. L'appelant écrit maintenant si, et seulement si,
+    ce compte est non nul.
+
+    **Les cinq tables, pas quatre.** `grants` en était absente, et rien
+    d'autre ne la vidait : `oauth_revoquer()` marque `revoked` sans retirer.
+    Une table jamais purgée sur un volume est un OOMKill à échéance, et un
+    OOMKill dont le redémarrage relit le même fichier est PERMANENT. Elle
+    porte donc sa péremption comme les autres — posée à la volée sur un état
+    écrit par une version d'avant, plutôt que de jeter des autorisations qui
+    marchent.
+    """
     now = maintenant if maintenant is not None else time.time()
+    retire = 0
     for cle in ("pending", "codes", "access", "refresh"):
-        data[cle] = {k: v for k, v in data[cle].items()
-                     if isinstance(v, dict) and float(v.get("exp", 0)) > now}
-    return data
+        garde = {k: v for k, v in data[cle].items()
+                 if isinstance(v, dict) and peremption(v) > now}
+        retire += len(data[cle]) - len(garde)
+        data[cle] = garde
+
+    grants = {}
+    for gid, grant in data["grants"].items():
+        if not isinstance(grant, dict):
+            retire += 1
+            continue
+        fin = peremption(grant)
+        if not fin:
+            # Un état écrit avant que les autorisations ne se périment. On ne
+            # le jette pas — ce serait déconnecter Claude sans prévenir — on
+            # lui pose la péremption qui lui manque. C'est un CHANGEMENT, donc
+            # il compte : sans ça, la réparation ne serait jamais persistée et
+            # se referait à chaque requête.
+            fin = now + GRANT_TTL
+            grant["exp"] = fin
+            retire += 1
+        if fin > now:
+            grants[gid] = grant
+        else:
+            retire += 1
+    data["grants"] = grants
+    return retire
+
+
+def oauth_frais():
+    """L'état débarrassé de ce qui a expiré, et le témoin qui dit si ce ménage
+    a réellement retiré quelque chose. Les deux vont ensemble : sans le témoin,
+    l'appelant ne peut que persister à l'aveugle."""
+    data = oauth_load()
+    return data, oauth_menage(data)
+
+
+# --------------------------------------------------------------------------
+# les réserves de mémoire — bornées, périssables, jamais persistées
+# --------------------------------------------------------------------------
+
+def memoire_poser(table, cle, valeur, plafond, maintenant=None):
+    """Range une entrée périssable, en gardant la table sous son plafond.
+
+    Le ménage passe d'abord sur ce qui a expiré ; s'il ne suffit pas, c'est la
+    plus proche de sa péremption qui saute. Toujours appelée sous
+    `_oauth_lock` : ces tables se lisent depuis plusieurs fils.
+    """
+    now = maintenant if maintenant is not None else time.time()
+    for morte in [k for k, v in table.items() if float(v.get("exp", 0)) <= now]:
+        del table[morte]
+    while len(table) >= plafond:
+        del table[min(table, key=lambda k: float(table[k].get("exp", 0)))]
+    table[cle] = valeur
+
+
+def memoire_lire(table, cle, maintenant=None):
+    """L'entrée si elle est encore vivante, None sinon. Ne la consomme pas."""
+    entree = table.get(cle)
+    if not isinstance(entree, dict):
+        return None
+    now = maintenant if maintenant is not None else time.time()
+    if float(entree.get("exp", 0)) <= now:
+        del table[cle]
+        return None
+    return entree
+
+
+def memoire_consommer(table, cle, maintenant=None):
+    """L'entrée, retirée dans le même geste. Un jeton à usage unique ne se
+    relit pas : il se prend, et il se prend même s'il était périmé — sinon un
+    rejeu laisserait l'entrée en place pour l'essai suivant."""
+    entree = table.pop(cle, None)
+    if not isinstance(entree, dict):
+        return None
+    now = maintenant if maintenant is not None else time.time()
+    return None if float(entree.get("exp", 0)) <= now else entree
 
 
 def oauth_revoquer(data, grant_id):
     """Révoque tout ce qui découle d'une même autorisation. Couper le seul jeton
-    présenté laisserait vivre le reste de la famille, donc l'accès volé."""
+    présenté laisserait vivre le reste de la famille, donc l'accès volé.
+
+    L'autorisation révoquée devient une PIERRE TOMBALE, et une pierre tombale
+    se périme : plus rien ne la référence — les trois tables qui la nommaient
+    viennent d'être vidées d'elle — et la page d'accueil ne l'affiche plus.
+    Sans péremption, révoquer FAISAIT GROSSIR l'état pour toujours ; le geste
+    de ménage était devenu le geste qui encombre.
+    """
     for cle in ("access", "refresh", "codes"):
         data[cle] = {k: v for k, v in data[cle].items() if v.get("grant_id") != grant_id}
     grant = data["grants"].get(grant_id)
     if isinstance(grant, dict):
         grant["revoked"] = horodate()
+        fin = time.time() + TOMBE_TTL
+        grant["exp"] = min(peremption(grant, fin), fin)
 
 
 def scopes_valides(demande):
@@ -191,17 +446,71 @@ def scopes_valides(demande):
     return " ".join(demandes)
 
 
+def analyse_url(valeur):
+    """L'URL découpée, ou None si elle est illisible.
+
+    Deux LEVÉES vivent dans `urlparse`, et toutes deux se déclenchent sur une
+    valeur venue de dehors — chaîne de requête, formulaire, ou ligne de requête
+    elle-même :
+
+      - `urlparse("http://[::1/x")` lève « Invalid IPv6 URL » AVANT même qu'on
+        puisse lire un champ, sur un crochet non fermé ;
+      - `urlparse("https://x:99999/").port` lève « Port out of range », de même
+        que « :abc ».
+
+    Toutes deux coupaient la socket sans réponse et crachaient une trace de
+    pile dans le journal du pod. Ne pas savoir lire une URL doit être un refus
+    ordinaire, jamais un accident : on rend None, et l'appelant refuse.
+    """
+    try:
+        return urlparse(str(valeur))
+    except ValueError:
+        return None
+
+
+def chemin_demande(cible):
+    """Le chemin d'une cible de requête, ou "" si elle est illisible.
+
+    La ligne de requête accepte une cible en forme absolue — `GET
+    http://hôte/x` —, donc `self.path` peut porter n'importe quelle URL. Une
+    cible illisible tombe sur le chemin vide, qui n'est routé nulle part : elle
+    récolte un 404, ce qu'un inconnu doit recevoir pour tout ce qu'on ne
+    comprend pas.
+    """
+    morceau = analyse_url(cible or "")
+    return morceau.path if morceau is not None else ""
+
+
 def canoniser_ressource(valeur):
-    """Compare deux URL de ressource sans se faire piéger par la casse, un port
-    par défaut, un fragment ou un slash final."""
-    morceau = urlparse(str(valeur))
+    """La forme canonique d'une URL de ressource, ou None si elle n'en a pas.
+
+    Compare deux URL sans se faire piéger par la casse, un port par défaut, un
+    fragment ou un slash final. La valeur vient d'un formulaire posté sur
+    `/token`, chemin public et non authentifié : le contrôle d'audience était
+    devenu la porte de déni de service qu'il était censé fermer. Une URL qu'on
+    n'arrive pas à lire n'est pas la nôtre — `ressource_connue()` refuse.
+    """
+    morceau = analyse_url(valeur)
+    if morceau is None:
+        return None
     hote = (morceau.hostname or "").lower()
     schema = (morceau.scheme or "").lower()
-    port = morceau.port
+    try:
+        port = morceau.port
+    except ValueError:
+        return None
     if port and not ((schema == "https" and port == 443) or (schema == "http" and port == 80)):
         hote = "%s:%d" % (hote, port)
     chemin = (morceau.path or "").rstrip("/")
     return "%s://%s%s" % (schema, hote, chemin)
+
+
+def ressource_connue(valeur):
+    """La ressource nommée est-elle la nôtre ? Le `is not None` n'est pas une
+    précaution de style : sans lui, deux URL illisibles se compareraient égales
+    et l'audience s'ouvrirait justement sur ce qu'on n'a pas su lire."""
+    canon = canoniser_ressource(valeur)
+    return canon is not None and canon == canoniser_ressource(MCP_URL)
 
 
 # --------------------------------------------------------------------------
@@ -370,12 +679,18 @@ def page_refus(titre, detail):
                            html.escape(detail)))
 
 
-def page_accueil(grants):
+def page_accueil(grants, csrf):
     """La page « Connecter Claude ». Derrière l'authentification humaine.
 
     Elle montre l'état réel du déploiement plutôt que ce qu'on croit avoir
     déployé : un jeton d'API absent ne se voit sinon qu'au premier appel
     d'outil, sous la forme d'une erreur qui semble venir de Claude.
+
+    Le `csrf` est le même pour tous les boutons de la page, et il ne sert
+    qu'une fois : révoquer consomme le jeton, la redirection vers `/` en rend
+    un frais. Le mot de passe du proxy est un credential ambiant que le
+    navigateur rejoue seul sur une soumission inter-site — sans ce jeton, une
+    page hostile coupait d'un POST toutes les autorisations du connecteur.
     """
     tri = outils_par_portee()
     epingle = infomaniak_mcp.compte_epingle()
@@ -383,22 +698,25 @@ def page_accueil(grants):
     # sa longueur, qui en dirait déjà sur sa forme.
     porteur = "oui" if infomaniak_mcp.jeton() else "NON — aucun outil ne pourra répondre"
 
+    marque = "<input type=\"hidden\" name=\"csrf\" value=\"%s\">" % html.escape(
+        csrf, quote=True)
+
     if grants:
         rangees = "".join(
             "<tr><td>%s</td><td>%s</td><td class=\"mono\">%s</td><td>"
-            "<form method=\"post\" action=\"/revoke\">"
+            "<form method=\"post\" action=\"/revoke\">%s"
             "<input type=\"hidden\" name=\"grant\" value=\"%s\">"
             "<button class=\"petit\" type=\"submit\">Révoquer</button>"
             "</form></td></tr>"
             % (html.escape(g.get("created", "")), html.escape(g.get("last", "")),
-               html.escape(g.get("scope", "")), html.escape(gid, quote=True))
+               html.escape(g.get("scope", "")), marque, html.escape(gid, quote=True))
             for gid, g in grants)
         table = ("<table><tr><th>accordée</th><th>vue</th><th>portée</th><th></th></tr>"
                  "%s</table>"
-                 "<form method=\"post\" action=\"/revoke\" style=\"margin-top:1rem\">"
+                 "<form method=\"post\" action=\"/revoke\" style=\"margin-top:1rem\">%s"
                  "<input type=\"hidden\" name=\"grant\" value=\"tout\">"
                  "<button class=\"non\" type=\"submit\">Tout révoquer</button></form>"
-                 % rangees)
+                 % (rangees, marque))
     else:
         table = "<p>Aucune autorisation en cours.</p>"
 
@@ -443,6 +761,26 @@ def redirection_erreur(redirect_uri, erreur, state, description=""):
 # le serveur
 # --------------------------------------------------------------------------
 
+class RefusCorps:
+    """Le témoin d'un corps qu'on a refusé de lire, et pourquoi.
+
+    Un objet, et non une chaîne. Le témoin valait « trop-gros », comparé au
+    corps DÉCODÉ : un client dont le corps valait exactement ces neuf
+    caractères se voyait répondre 413. Une sentinelle que la donnée qu'elle
+    décrit peut imiter n'est pas une sentinelle.
+    """
+
+    __slots__ = ("code", "quoi")
+
+    def __init__(self, code, quoi):
+        self.code = code
+        self.quoi = quoi
+
+
+TROP_GROS = RefusCorps(413, "le corps annoncé dépasse ce que ce chemin accepte")
+TROP_LENT = RefusCorps(408, "le corps n'est pas arrivé dans le temps imparti")
+
+
 class Poignee(BaseHTTPRequestHandler):
     server_version = "infomaniak-domains/" + infomaniak_mcp.VERSION
     protocol_version = "HTTP/1.1"
@@ -458,34 +796,67 @@ class Poignee(BaseHTTPRequestHandler):
         dans un rechargement. Aucun en-tête n'est journalisé : c'est là que
         vivent le Bearer et le mot de passe du proxy.
         """
-        chemin = urlparse(self.path or "").path
+        chemin = chemin_demande(self.path)
         print("%s %s %s" % (horodate(), self.command or "?", chemin), flush=True)
+
+    def _corps_en_suspens(self):
+        """Reste-t-il, dans le tampon, un corps annoncé que personne n'a lu ?
+
+        C'est la question qui décide si la connexion peut resservir. Un corps
+        qui traîne se fait lire comme la requête suivante : `GET /mcp` avec un
+        corps faisait servir une requête clandestine, choisie par l'appelant,
+        sur un chemin protégé.
+        """
+        try:
+            annonce = int(self.headers.get("Content-Length") or 0)
+        except (ValueError, AttributeError):
+            annonce = -1
+        return annonce != 0 and not getattr(self, "_corps_consomme", False)
 
     def _fin_de_reponse(self):
         """Rend True — pour que `return self._json(...)` interrompe vraiment le
         traitement — et coupe la connexion si un corps annoncé n'a pas été lu.
 
-        Les deux moitiés répondent à deux failles jumelles, trouvées par audit
-        adverse le 2026-08-31 et l'une comme l'autre prouvées :
+        Deux failles jumelles, trouvées par audit adverse le 2026-08-31 et
+        l'une comme l'autre prouvées, vivaient ici :
 
         - sans valeur de retour, `if refus is not None: return refus` ne se
           déclenchait jamais : le 401 partait, puis le traitement continuait et
           un anonyme recevait un 200 complet sur /mcp ;
-        - un corps annoncé et non consommé reste dans le tampon et se fait lire
-          comme une requête pipelinée : `GET /mcp` avec un corps faisait servir
-          une requête clandestine sur un chemin protégé.
+        - un corps annoncé et non consommé devenait une requête pipelinée.
+
+        Ce qu'il RESTE ici n'est plus qu'une ceinture. La décision de couper se
+        prend désormais AVANT d'écrire les en-têtes, dans `_prelude()` : la
+        poser après `end_headers()` faisait partir une réponse d'allure
+        keep-alive sur une socket que le serveur allait fermer, si bien que le
+        proxy la remettait dans son pool et voyait sa requête suivante mourir
+        sans réponse. Couper sans le dire, c'est faire porter la panne à
+        l'intermédiaire.
         """
-        try:
-            annonce = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            annonce = -1
-        if annonce != 0 and not getattr(self, "_corps_consomme", False):
+        if self._corps_en_suspens():
             self.close_connection = True
         return True
 
+    def _prelude(self, code):
+        """Ouvre la réponse, en ayant D'ABORD décidé si la connexion survit.
+
+        L'ordre est tout : `send_response()` fige la ligne de statut, et
+        `send_header("Connection", …)` n'a plus de sens une fois les en-têtes
+        terminés. On tranche donc ici, avant le premier octet, et on ANNONCE ce
+        qu'on a tranché — un client, un proxy, un pool de connexions ne peuvent
+        se conduire correctement que devant une réponse qui dit la vérité sur
+        la connexion qui la porte.
+        """
+        coupe = self.close_connection or self._corps_en_suspens()
+        self.send_response(code)
+        if coupe:
+            # Pose aussi `close_connection`, par contrat de `send_header`.
+            self.send_header("Connection", "close")
+        return coupe
+
     def _send(self, code, corps, ctype="text/html; charset=utf-8", extra=None):
         octets = corps.encode("utf-8") if isinstance(corps, str) else corps
-        self.send_response(code)
+        self._prelude(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(octets)))
         self.send_header("Cache-Control", "no-store")
@@ -499,7 +870,7 @@ class Poignee(BaseHTTPRequestHandler):
 
     def _json(self, code, charge, extra=None, cache=None):
         octets = json.dumps(charge, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
+        self._prelude(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(octets)))
         self.send_header("Cache-Control", cache or "no-store")
@@ -509,24 +880,114 @@ class Poignee(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(octets)
-            return self._fin_de_reponse()
+        # Le retour est HORS du `if`, comme dans `_send` : sur un HEAD, `_json`
+        # rendait None, donc `if refus is not None` ne se déclenchait pas et le
+        # traitement continuait — deux réponses sur une seule requête. C'est
+        # exactement la faille que `_fin_de_reponse()` existe pour fermer.
+        return self._fin_de_reponse()
 
     def _redirect(self, location, code=303):
-        self.send_response(code)
+        self._prelude(code)
         self.send_header("Location", location)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", "0")
         self.end_headers()
         return self._fin_de_reponse()
 
+    # ---- le cadrage de la requête ----------------------------------------
+
+    def parse_request(self):
+        """Le cadrage, tranché AVANT le routage — et le départ du chronomètre.
+
+        Deux choses se règlent ici, et nulle part ailleurs, parce qu'ici est
+        le seul endroit que TOUTES les méthodes traversent : celles qu'on
+        implémente comme celles qu'on ne connaît pas.
+
+        **Transfer-Encoding est refusé, sans exception.** La couche HTTP de la
+        stdlib ne l'implémente pas : elle cadre sur le seul `Content-Length` et
+        ignore `Transfer-Encoding`. Une requête portant les deux se fait donc
+        découper d'une façon par nous et d'une autre par le proxy en amont —
+        la désynchronisation CL.TE, prouvée en socket brute sur ce serveur :
+        DEUX réponses partaient, dont une pour une requête clandestine que
+        l'appelant avait glissée dans le corps. On ne « corrige » pas ce
+        désaccord en implémentant le chunked ; on refuse d'être le deuxième
+        avis. 400, et la connexion se ferme : la garder reviendrait à raisonner
+        sur un tampon dont on vient d'admettre qu'on ne sait pas le découper.
+
+        **Un Content-Length douteux est refusé de même** : annoncé deux fois
+        avec deux valeurs, ou écrit autrement qu'en chiffres ASCII. `int()`
+        accepte « +5 », « 1_0 » et les chiffres pleine chasse ; un proxy en
+        amont, non. Là où deux couches peuvent lire deux longueurs, il n'y a
+        pas de bonne réponse à servir — on n'en sert aucune.
+
+        Deux annonces IDENTIQUES sont acceptées : le RFC 7230 §3.3.2 les
+        autorise, et aucune ambiguïté n'en découle. Les espaces autour de la
+        valeur ne sont pas notre affaire non plus — le parseur de la stdlib les
+        a déjà retirés, comme le prescrit le même RFC.
+        """
+        if not BaseHTTPRequestHandler.parse_request(self):
+            return False
+        # Le chronomètre part ici : la ligne de requête et les en-têtes sont
+        # lus, le corps ne l'est pas encore. C'est de cet instant que court le
+        # budget de `_corps_borne`.
+        self._debut_requete = time.monotonic()
+        self._corps_consomme = False
+
+        if self.headers.get_all("Transfer-Encoding"):
+            return self._refus_cadrage(
+                "Transfer-Encoding n'est pas accepté : ce serveur ne cadre que "
+                "sur Content-Length.")
+        longueurs = {v.strip() for v in (self.headers.get_all("Content-Length") or [])}
+        if len(longueurs) > 1:
+            return self._refus_cadrage(
+                "Content-Length est annoncé plusieurs fois, et pas deux fois "
+                "pareil.")
+        # Des chiffres ASCII, et rien d'autre : `.isdigit()` dirait oui aux
+        # chiffres pleine chasse, qu'`int()` accepte aussi — mais qu'un proxy
+        # en amont lira tout autrement, s'il ne les refuse pas.
+        if longueurs and not re.fullmatch(r"[0-9]{1,15}", longueurs.pop()):
+            return self._refus_cadrage(
+                "Content-Length n'est pas un nombre d'octets.")
+        return True
+
+    def _refus_cadrage(self, pourquoi):
+        """400, la connexion coupée, et False pour que rien ne soit routé."""
+        self.close_connection = True
+        self._corps_consomme = True     # on ne lira pas ce corps : il est mort avec
+        self._send(400, page_refus("Requête mal cadrée", pourquoi))
+        return False
+
     # ---- entrées ---------------------------------------------------------
 
-    def _corps_borne(self, limite):
-        """Rend le corps, "" s'il n'y en a pas, ou le témoin "trop-gros".
+    def _refus_corps(self, temoin, en_json=False):
+        """La réponse que mérite un corps refusé, dans le format du chemin."""
+        if en_json:
+            return self._json(temoin.code, {"error": "invalid_request",
+                                            "error_description": temoin.quoi})
+        return self._send(temoin.code, page_refus("Corps refusé", temoin.quoi))
 
-        Une borne explicite, parce que rien d'autre n'en pose : sans elle, un
-        Content-Length de plusieurs gigaoctets tiendrait un thread et la
-        mémoire du conteneur.
+    def _corps_borne(self, limite):
+        """Rend le corps, "" s'il n'y en a pas, ou un témoin de refus.
+
+        Deux bornes, et deux dimensions distinctes.
+
+        **La taille** : sans elle, un Content-Length de plusieurs gigaoctets
+        tiendrait un thread et la mémoire du conteneur. Témoin `TROP_GROS`.
+
+        **La durée** : `timeout = 30` est un délai PAR recv, pas un plafond de
+        durée. Un octet toutes les vingt-neuf secondes tenait donc un thread
+        indéfiniment — anonymement, sans authentification, et sans que rien ne
+        le compte. C'est le slowloris, et ThreadingHTTPServer ne plafonne pas
+        ses threads : quelques centaines de connexions au goutte-à-goutte et le
+        pod ne répond plus, y compris à sa sonde de readiness.
+
+        On lit donc par tranches contre une échéance ABSOLUE, calculée depuis
+        le début de la requête. Témoin `TROP_LENT`, que l'appelant rend en 408.
+        Une connexion qui a dépassé son budget ne peut plus servir : son tampon
+        contient un corps à moitié lu, dont personne ne sait où il s'arrête.
+
+        Les deux témoins sont des OBJETS, non des chaînes : un corps valant
+        exactement « trop-gros » se faisait refuser comme s'il l'était.
         """
         try:
             taille = int(self.headers.get("Content-Length") or 0)
@@ -538,12 +999,42 @@ class Poignee(BaseHTTPRequestHandler):
         if taille > limite:
             # Le corps n'est pas lu : la connexion ne peut plus servir.
             self.close_connection = True
-            return "trop-gros"
-        brut = self.rfile.read(taille).decode("utf-8", "replace")
+            return TROP_GROS
+
+        echeance = getattr(self, "_debut_requete", time.monotonic()) + DELAI_CORPS
+        morceaux, lu = [], 0
+        try:
+            while lu < taille:
+                reste = echeance - time.monotonic()
+                if reste <= 0:
+                    self.close_connection = True
+                    return TROP_LENT
+                self.connection.settimeout(reste)
+                # `read1` rend ce qui est arrivé, sans attendre le compte rond :
+                # c'est ce qui permet de revenir vérifier l'échéance entre deux
+                # tranches. `read(n)` bloquerait jusqu'aux n octets, et le
+                # budget ne serait consulté qu'une fois trop tard.
+                bloc = self.rfile.read1(min(taille - lu, 65536))
+                if not bloc:
+                    # Fin de flux avant le compte annoncé : le corps est
+                    # tronqué, et ce qu'on en a ne se distingue pas d'un corps
+                    # complet. On le traite comme un dépassement.
+                    self.close_connection = True
+                    return TROP_LENT
+                morceaux.append(bloc)
+                lu += len(bloc)
+        except (OSError, ValueError):
+            # `socket.timeout` en est un ; une socket coupée en plein corps
+            # aussi. Dans les deux cas il n'y a pas de corps à servir.
+            self.close_connection = True
+            return TROP_LENT
+        finally:
+            self.connection.settimeout(self.timeout)
+
         # Le témoin dit que le tampon est vide : sans lui, un corps annoncé et
         # jamais lu se ferait interpréter comme une requête pipelinée.
         self._corps_consomme = True
-        return brut
+        return b"".join(morceaux).decode("utf-8", "replace")
 
     def _stricte(self, brut):
         """Décode une chaîne de paramètres en REFUSANT les clés répétées.
@@ -564,38 +1055,89 @@ class Poignee(BaseHTTPRequestHandler):
         return vus
 
     def _query_stricte(self):
-        return self._stricte(urlparse(self.path).query)
+        morceau = analyse_url(self.path)
+        return None if morceau is None else self._stricte(morceau.query)
 
     def _form_stricte(self):
+        """Le formulaire décodé, None s'il est illisible, ou un témoin de refus
+        que l'appelant doit rendre tel quel — 413 ou 408, jamais 400 : « je
+        n'ai pas su lire » et « tu as dépassé ta borne » ne sont pas la même
+        chose, et un client qui les confond réessaie ce qu'il ne devrait pas."""
         brut = self._corps_borne(64 * 1024)
-        if brut == "trop-gros":
-            return None
+        if isinstance(brut, RefusCorps):
+            return brut
         return self._stricte(brut)
 
     # ---- l'authentification humaine, tenue devant --------------------------
 
-    def _humain_present(self):
-        """Une trace d'authentification humaine posée par le proxy.
+    def _boucle_locale(self):
+        """La requête vient-elle de l'intérieur du conteneur ?
 
-        Le mot de passe est vérifié par Traefik, pas ici : ce contrôle ne prouve
-        donc rien à lui seul, et n'est pas la barrière. Il existe pour qu'une
-        exemption de frontière posée par erreur sur /authorize ou /consent se
-        solde par un 401 visible plutôt que par un code d'autorisation émis à
-        un inconnu — c'est-à-dire pour que l'erreur se voie.
+        L'adresse du pair est constatée par le noyau, pas écrite par
+        l'appelant : c'est la seule chose, dans une requête HTTP, qu'on ne
+        puisse pas forger. En production rien n'arrive par la boucle locale —
+        Traefik appelle depuis son IP de pod, la sonde de readiness depuis
+        celle du nœud, et ce pod n'est pas en `hostNetwork`. Une requête en
+        127.0.0.1 est donc déjà dans le conteneur, où il n'y a plus rien à lui
+        refuser.
         """
-        brut = self.headers.get("Authorization") or ""
-        if brut.startswith("Basic "):
-            return True
-        # oauth2-proxy, si l'authentification humaine bascule un jour, ne
-        # repasse pas de Basic : il pose l'identité en en-tête.
-        return bool(self.headers.get("X-Forwarded-User")
-                    or self.headers.get("X-Auth-Request-User"))
+        adresse = (self.client_address or ("",))[0]
+        if adresse.startswith("::ffff:"):       # IPv4 vue par une pile IPv6
+            adresse = adresse[7:]
+        return adresse == "::1" or adresse.startswith("127.")
+
+    def _humain_present(self):
+        """La marque que seul le proxy peut produire.
+
+        Ce qu'on croyait avant : `Authorization: Basic n'importe-quoi` ou un
+        `X-Forwarded-User` suffisaient. Or ces deux en-têtes, l'appelant les
+        écrit lui-même — et le pod écoute sur 8080 : tout voisin du cluster
+        atteignait /authorize, la page qui émet les codes d'autorisation, sans
+        jamais passer par Traefik ni par son mot de passe.
+
+        On compare donc un secret partagé avec le proxy, en temps constant, et
+        sur des empreintes plutôt que sur les valeurs : `compare_digest` lève
+        sur une chaîne non-ASCII, et l'en-tête vient de dehors.
+
+        **Une seule occurrence acceptée.** Si le middleware ajoutait la marque
+        au lieu de l'écraser, une copie hostile arriverait en tête et serait
+        celle que `get()` rend. Le middleware doit écraser ; on refuse le
+        doublon pour que sa mauvaise configuration se voie plutôt que
+        s'exploite.
+
+        **Le vide alarme.** Sans `INFOMANIAK_MARQUE_PROXY`, il n'existe aucune
+        marque à comparer : le serveur ne sert plus les pages humaines qu'à la
+        boucle locale. En test — banc jetable sur 127.0.0.1 — tout continue de
+        fonctionner ; en production, où rien n'arrive par la boucle locale,
+        tout est refusé. Une variable oubliée rend donc le connecteur
+        inutilisable et visiblement cassé, jamais ouvert en silence.
+        """
+        if not MARQUE_PROXY:
+            return self._boucle_locale()
+        recus = self.headers.get_all(ENTETE_MARQUE) or []
+        if len(recus) != 1:
+            return False
+        return hmac.compare_digest(empreinte(recus[0].strip()),
+                                   empreinte(MARQUE_PROXY))
 
     def _defi_humain(self):
-        return self._send(401, page_refus(
-            "Authentification requise",
-            "Cette page est réservée au propriétaire du serveur."),
-            extra=[("WWW-Authenticate", 'Basic realm="domaines Infomaniak"')])
+        """401, et il dit LEQUEL des deux cas s'est produit.
+
+        Le défi Basic est conservé parce que la frontière humaine reste celle
+        de Traefik : c'est à lui que le navigateur doit présenter le mot de
+        passe. Mais un 401 muet enverrait Vincent taper un mot de passe qui ne
+        sert à rien quand la vraie cause est une variable absente — et cette
+        heure-là, on l'a déjà payée ailleurs.
+        """
+        if MARQUE_PROXY:
+            detail = ("Cette page est réservée au propriétaire du serveur, et "
+                      "cette requête n'a pas traversé le proxy qui l'authentifie.")
+        else:
+            detail = ("Ce serveur n'a pas de marque de proxy (INFOMANIAK_MARQUE_PROXY) : "
+                      "il ne sert donc les pages humaines qu'à lui-même. Tant que la "
+                      "variable manque, aucun mot de passe n'ouvrira cette page.")
+        return self._send(401, page_refus("Authentification requise", detail),
+                          extra=[("WWW-Authenticate", 'Basic realm="domaines Infomaniak"')])
 
     # ---- le porteur ------------------------------------------------------
 
@@ -615,7 +1157,22 @@ class Poignee(BaseHTTPRequestHandler):
                           extra=[("WWW-Authenticate", ", ".join(parties))])
 
     def _porteur(self):
-        """Le jeton présenté, validé. Rend (portées, None) ou (None, réponse)."""
+        """Le jeton présenté, validé. Rend (portées, None) ou (None, réponse).
+
+        **Une lecture n'est pas une écriture.** Cette fonction réécrivait TOUT
+        l'état — les cinq tables, sérialisées, sur le PVC, sous le verrou
+        global — à chaque requête authentifiée. Prouvé : le mtime de
+        `oauth.json` changeait sur un simple `tools/list`, et jusque sur un
+        `GET /mcp` qui ne rend qu'un 405. C'est ce qui rendait létale une table
+        qui enfle : le coût d'une entrée de plus se payait par requête, pas par
+        rotation.
+
+        On ne persiste donc que si quelque chose a réellement changé : un
+        ménage qui a retiré une entrée, ou un horodatage d'activité qu'on ne
+        rafraîchit qu'une fois par `ACTIVITE_PAS`. La question à laquelle
+        `last` répond — « quand ce connecteur a-t-il servi ? » — n'a jamais eu
+        besoin de la seconde près.
+        """
         brut = self.headers.get("Authorization") or ""
         if not brut:
             return None, self._defi_bearer()
@@ -628,18 +1185,40 @@ class Poignee(BaseHTTPRequestHandler):
         if not brut.startswith("Bearer "):
             return None, self._defi_bearer("invalid_token")
         with _oauth_lock:
-            data = oauth_menage(oauth_load())
+            data, change = oauth_frais()
             entree = data["access"].get(empreinte(brut[7:].strip()))
             if not isinstance(entree, dict):
+                if change:
+                    oauth_save(data)
                 return None, self._defi_bearer("invalid_token")
             if entree.get("aud") != MCP_URL:
+                if change:
+                    oauth_save(data)
                 return None, self._defi_bearer("invalid_token",
                                                "jeton émis pour une autre ressource")
-            grant = data["grants"].get(entree.get("grant_id")) or {}
-            if grant.get("revoked"):
+            grant = data["grants"].get(entree.get("grant_id"))
+            if isinstance(grant, dict) and grant.get("revoked"):
+                if change:
+                    oauth_save(data)
                 return None, self._defi_bearer("invalid_token", "autorisation révoquée")
-            grant["last"] = horodate()
-            oauth_save(data)
+            # L'horodatage ne se pose que sur une autorisation qui EXISTE
+            # encore. Sur un dictionnaire fabriqué à la volée — le cas d'un
+            # jeton d'accès dont l'autorisation vient d'expirer, une heure au
+            # plus tous les quatre-vingt-dix jours — l'écrire ne mémoriserait
+            # rien et ferait réécrire tout l'état à chaque requête. C'est-à-dire
+            # rouvrir, dans un coin, la faille qu'on vient de fermer.
+            maintenant = time.time()
+            if isinstance(grant, dict):
+                try:
+                    dernier = float(grant.get("last_ts") or 0)
+                except (TypeError, ValueError):
+                    dernier = 0.0
+                if maintenant - dernier >= ACTIVITE_PAS:
+                    grant["last"] = horodate()
+                    grant["last_ts"] = maintenant
+                    change += 1
+            if change:
+                oauth_save(data)
         return set((entree.get("scope") or "").split()), None
 
     # ---- le transport MCP ------------------------------------------------
@@ -666,8 +1245,8 @@ class Poignee(BaseHTTPRequestHandler):
         if not ctype.startswith("application/json"):
             return self._json(415, {"error": "invalid_request"})
         brut = self._corps_borne(256 * 1024)
-        if brut == "trop-gros":
-            return self._json(413, {"error": "invalid_request"})
+        if isinstance(brut, RefusCorps):
+            return self._refus_corps(brut, en_json=True)
         try:
             message = json.loads(brut) if brut.strip() else None
         except ValueError:
@@ -687,7 +1266,27 @@ class Poignee(BaseHTTPRequestHandler):
         # droit de demander, l'armement ce que ce déploiement accepte de faire.
         # Les deux doivent céder pour qu'une zone bouge.
         if methode == "tools/call":
-            nom = (message.get("params") or {}).get("name")
+            # Deux gardes, deux plantages prouvés : `params` non-objet — une
+            # liste, une chaîne — n'a pas de `.get`, et un `name` non-hachable
+            # — une liste, un objet — fait lever `BY_NAME.get`. L'exception
+            # partait AVANT le contrôle de portée : connexion coupée, trace de
+            # pile dans le journal, et le contrôle jamais atteint. Un contrôle
+            # qu'un paramètre mal formé fait sauter n'est pas un contrôle.
+            #
+            # Ce qui est mal formé est REFUSÉ ICI, en -32602, plutôt que laissé
+            # descendre. `handle()` s'en garde aussi de son côté — il est appelé
+            # sur stdio, où ce transport ne le protège pas — mais il rendrait
+            # alors « cet outil n'existe pas », c'est-à-dire un résultat d'outil
+            # là où la faute est dans l'enveloppe. Ce n'est pas l'outil qui
+            # manque : c'est la requête qui n'en nomme aucun.
+            params = message.get("params")
+            nom = params.get("name") if isinstance(params, dict) else None
+            if not isinstance(params, dict) or not isinstance(nom, str):
+                return self._json(200, {
+                    "jsonrpc": "2.0", "id": mid,
+                    "error": {"code": -32602,
+                              "message": "params doit être un objet portant un "
+                                         "name de type chaîne"}})
             outil = BY_NAME.get(nom)
             if outil is not None:
                 exigee = portee_outil(outil)
@@ -713,11 +1312,50 @@ class Poignee(BaseHTTPRequestHandler):
 
     # ---- le serveur d'autorisation ---------------------------------------
 
+    def _exige_navigation(self):
+        """Refuse ce qui n'est pas une navigation de premier plan. Rend None
+        quand ça en est une, une réponse sinon.
+
+        Le garde des pages GET qui ÉCRIVENT dans une table bornée. Une page
+        hostile boucle sur une balise `<img>`, le navigateur rejoue le
+        credential ambiant tout seul, et chaque chargement ajoute une entrée.
+        Contre une table de 32 places, trente-deux chargements suffisent à
+        évincer celle de Vincent.
+
+        Sec-Fetch-Site n'entre PAS dans le contrôle, contrairement à /consent :
+        Claude ouvre /authorize depuis claude.ai, donc en `cross-site` — la
+        refuser fermerait le connecteur pour de bon. C'est `Dest: document` qui
+        distingue une navigation d'un chargement d'image, et c'est là que vit
+        la différence entre les deux pages. En-têtes absents, on laisse passer :
+        un navigateur qui ne les envoie pas ne peut pas non plus fabriquer
+        l'attaque, et une sonde en ligne de commande doit continuer de servir.
+
+        **En un seul exemplaire, et c'est le correctif.** Le contrôle vivait
+        recopié dans `_authorize()` seule ; `_accueil()` frappe pourtant, elle
+        aussi, un jeton dans une table de 32 places — celle qui autorise la
+        RÉVOCATION. Trente-deux chargements hostiles de `/` interdisaient donc
+        à Vincent de révoquer quoi que ce soit, au moment précis où il en a
+        besoin. Une garde recopiée est une garde qu'on oublie de recopier.
+        """
+        dest = self.headers.get("Sec-Fetch-Dest")
+        mode = self.headers.get("Sec-Fetch-Mode")
+        if (dest and dest != "document") or (mode and mode != "navigate"):
+            return self._send(403, page_refus(
+                "Ce n'est pas une navigation (%s)" % ((dest or mode)[:40]),
+                "Cette page ne s'ouvre qu'en navigation de premier plan. Un "
+                "chargement en arrière-plan n'exprime aucune intention."))
+        return None
+
     def _authorize(self):
         """Rend un FORMULAIRE. N'émet jamais de code — c'est tout l'intérêt de
         le séparer de /consent."""
         if not self._humain_present():
             return self._defi_humain()
+
+        refus = self._exige_navigation()
+        if refus is not None:
+            return refus
+
         q = self._query_stricte()
         if q is None:
             return self._send(400, page_refus(
@@ -730,8 +1368,14 @@ class Poignee(BaseHTTPRequestHandler):
                 "Client inconnu",
                 "Cette demande ne vient pas d'un client connu de ce serveur."))
         redirect_uri = q.get("redirect_uri", "")
-        morceau = urlparse(redirect_uri)
-        if (redirect_uri not in ALLOWED_REDIRECTS or morceau.fragment
+        # L'égalité stricte se teste sur la CHAÎNE, avant d'essayer de découper
+        # quoi que ce soit : `urlparse` lève sur un crochet IPv6 non fermé, et
+        # découper d'abord faisait planter la page sur une valeur qu'on
+        # s'apprêtait de toute façon à refuser. Les contrôles qui suivent sont
+        # des ceintures : l'adresse est déjà l'une des nôtres.
+        morceau = analyse_url(redirect_uri)
+        if (redirect_uri not in ALLOWED_REDIRECTS or morceau is None
+                or morceau.fragment
                 or morceau.username or morceau.password or ".." in redirect_uri):
             return self._send(400, page_refus(
                 "Adresse de retour refusée",
@@ -751,7 +1395,7 @@ class Poignee(BaseHTTPRequestHandler):
         if not re.fullmatch(r"[A-Za-z0-9._~-]{43,128}", challenge or ""):
             return refuser("invalid_request", "code_challenge absent ou mal formé")
         ressource = q.get("resource")
-        if ressource and canoniser_ressource(ressource) != canoniser_ressource(MCP_URL):
+        if ressource and not ressource_connue(ressource):
             return refuser("invalid_target")
         scope = scopes_valides(q.get("scope"))
         if scope is None:
@@ -759,8 +1403,18 @@ class Poignee(BaseHTTPRequestHandler):
 
         csrf = jeton()
         with _oauth_lock:
-            data = oauth_menage(oauth_load())
-            data["pending"][empreinte(csrf)] = {
+            data, _ = oauth_frais()
+            attente = data["pending"]
+            # La borne, seconde moitié de la garde. Un humain n'a jamais
+            # soixante-quatre consentements en cours ; au-delà, on évince la
+            # plus proche de sa péremption — et sa fenêtre de grâce avec elle,
+            # sinon la mémoire garderait une réponse dont la demande n'existe
+            # plus.
+            while len(attente) >= PENDING_MAX:
+                vieille = min(attente, key=lambda k: float(attente[k].get("exp", 0)))
+                del attente[vieille]
+                _grace.pop(vieille, None)
+            attente[empreinte(csrf)] = {
                 "client_id": CLIENT_ID, "redirect_uri": redirect_uri,
                 "code_challenge": challenge, "scope": scope,
                 "resource": MCP_URL, "state": state,
@@ -799,6 +1453,8 @@ class Poignee(BaseHTTPRequestHandler):
                 "Le mot de passe est rejoué automatiquement par le navigateur : "
                 "une soumission venue d'ailleurs ne prouve rien."))
         form = self._form_stricte()
+        if isinstance(form, RefusCorps):
+            return self._refus_corps(form)
         if form is None:
             return self._send(400, page_refus("Demande mal formée", "Corps illisible."))
 
@@ -808,11 +1464,14 @@ class Poignee(BaseHTTPRequestHandler):
         # qui changerait l'adresse de retour entre l'affichage et l'envoi.
         csrf = form.get("csrf", "")
         action = form.get("action", "")
+        marque_csrf = empreinte(csrf)
         code = jeton()
         with _oauth_lock:
-            data = oauth_menage(oauth_load())
-            demande = data["pending"].get(empreinte(csrf))
+            data, retire = oauth_frais()
+            demande = data["pending"].get(marque_csrf)
             if not isinstance(demande, dict):
+                if retire:
+                    oauth_save(data)
                 return self._send(400, page_refus(
                     "Demande introuvable ou expirée",
                     "Relancez la connexion depuis Claude."))
@@ -821,33 +1480,79 @@ class Poignee(BaseHTTPRequestHandler):
             # abouti. On lui rend donc la MÊME réponse pendant une courte
             # fenêtre — le code reste à usage unique là où ça compte, à
             # l'échange.
-            if demande.get("reponse"):
-                return self._redirect(demande["reponse"], code=302)
+            #
+            # Deux choses ont changé ici, et chacune ferme une faille prouvée :
+            #
+            # - la réponse ne vit plus dans le fichier. Elle porte le code en
+            #   CLAIR, quand `empreinte()` promet noir sur blanc qu'un état volé
+            #   ne donne aucun jeton utilisable — instantané du PVC, kubectl
+            #   exec, kubectl cp. Le fichier ne garde que l'empreinte du code
+            #   émis ; l'URL vit en mémoire, avec la même péremption.
+            # - on ne re-livre qu'un code encore VIERGE. Le geste même pour
+            #   lequel la grâce existe — recharger la page — rendait un code
+            #   déjà échangé ; l'échanger une seconde fois révoque toute la
+            #   famille et tue l'autorisation qui marchait.
+            #
+            # Le prix, assumé : après un redémarrage, la mémoire est vide et la
+            # grâce ne joue plus. Recharger rend alors ce refus-ci plutôt que
+            # l'ancienne réponse — l'autorisation déjà partie chez Claude,
+            # elle, n'est pas touchée.
+            if demande.get("code") or demande.get("reponse"):
+                emis = data["codes"].get(demande.get("code") or "")
+                grace = memoire_lire(_grace, marque_csrf)
+                if (grace is None or not isinstance(emis, dict)
+                        or emis.get("used")):
+                    return self._send(400, page_refus(
+                        "Autorisation déjà aboutie",
+                        "Ce consentement a déjà rendu son code, et il ne se "
+                        "rend qu'une fois. Relancez la connexion depuis Claude."))
+                return self._redirect(grace["reponse"], code=302)
             if action != "autoriser":
-                del data["pending"][empreinte(csrf)]
+                del data["pending"][marque_csrf]
                 oauth_save(data)
                 return self._redirect(redirection_erreur(
                     demande["redirect_uri"], "access_denied", demande.get("state", "")),
                     code=302)
             grant_id = jeton()
-            data["codes"][empreinte(code)] = {
+            marque_code = empreinte(code)
+            data["codes"][marque_code] = {
                 "client_id": demande["client_id"], "redirect_uri": demande["redirect_uri"],
                 "code_challenge": demande["code_challenge"], "scope": demande["scope"],
                 "resource": demande["resource"], "grant_id": grant_id,
                 "exp": time.time() + CODE_TTL, "used": False}
-            data["grants"][grant_id] = {
-                "created": horodate(), "last": horodate(), "scope": demande["scope"],
+            # Une autorisation PÉRIT, et elle est PLAFONNÉE. Elle ne faisait
+            # ni l'un ni l'autre : `oauth_menage()` ne l'a jamais vue et
+            # `oauth_revoquer()` la marquait sans la retirer, si bien que la
+            # seule table qu'aucun mécanisme ne vidait était aussi la seule à
+            # ne pas se périmer. Sa péremption est celle de la chaîne qu'elle
+            # peut engendrer : au-delà, plus aucun jeton n'en descend, donc
+            # elle ne répond plus à personne.
+            attentes = data["grants"]
+            while len(attentes) >= GRANTS_MAX:
+                del attentes[min(attentes, key=lambda k: peremption(
+                    attentes[k] if isinstance(attentes[k], dict) else {}))]
+            attentes[grant_id] = {
+                "created": horodate(), "last": horodate(), "last_ts": time.time(),
+                "scope": demande["scope"], "exp": time.time() + GRANT_TTL,
                 "redirect_uri": demande["redirect_uri"], "revoked": ""}
             champs = {"code": code, "iss": PUBLIC_BASE}
             if demande.get("state"):
                 champs["state"] = demande["state"]
             joint = "&" if "?" in demande["redirect_uri"] else "?"
             reponse = demande["redirect_uri"] + joint + urlencode(champs)
-            # La demande n'est pas supprimée : elle garde sa réponse le temps de
-            # la fenêtre de grâce, puis expire comme le reste.
-            demande["reponse"] = reponse
+            # La demande n'est pas supprimée : elle retient l'EMPREINTE du code
+            # qu'elle a servi — de quoi reconnaître un rechargement et savoir si
+            # ce code est encore vierge — puis expire comme le reste.
+            demande.pop("reponse", None)      # un état écrit par la version d'avant
+            demande["code"] = marque_code
             demande["exp"] = time.time() + REJEU_TTL
             durable = oauth_save(data)
+            if durable:
+                # Après l'écriture, jamais avant : la mémoire ne doit pas
+                # promettre une réponse dont le code n'est pas persisté.
+                memoire_poser(_grace, marque_csrf,
+                              {"reponse": reponse, "exp": time.time() + REJEU_TTL},
+                              GRACE_MAX)
         if not durable:
             # Un code non persisté est un code rejouable indéfiniment : on
             # préfère échouer bruyamment que d'en émettre un.
@@ -862,13 +1567,15 @@ class Poignee(BaseHTTPRequestHandler):
             return self._json(415, {"error": "invalid_request",
                                     "error_description": "form-urlencoded attendu"})
         form = self._form_stricte()
+        if isinstance(form, RefusCorps):
+            return self._refus_corps(form, en_json=True)
         if form is None:
             return self._json(400, {"error": "invalid_request"})
         # RFC 8707 : si le client nomme la ressource, elle doit être la nôtre.
         # Le contrôle vaut aux deux bouts — ici, et au moment de présenter le
         # jeton (`_porteur`), qui refuse une autre audience.
         ressource = form.get("resource")
-        if ressource and canoniser_ressource(ressource) != canoniser_ressource(MCP_URL):
+        if ressource and not ressource_connue(ressource):
             return self._json(400, {"error": "invalid_target"})
         genre = form.get("grant_type")
         if genre == "authorization_code":
@@ -877,16 +1584,30 @@ class Poignee(BaseHTTPRequestHandler):
             return self._token_refresh(form)
         return self._json(400, {"error": "unsupported_grant_type"})
 
-    def _emettre(self, data, grant_id, scope, chain_exp=None):
-        """Émet une paire de jetons. Appelé SOUS le verrou, jamais hors de lui."""
+    def _emettre(self, data, grant_id, scope, aud, chain_exp=None):
+        """Émet une paire de jetons. Appelé SOUS le verrou, jamais hors de lui.
+
+        **L'audience est un ARGUMENT, et c'est tout l'objet du correctif.**
+        Elle valait `MCP_URL`, c'est-à-dire la configuration du processus au
+        moment d'émettre — la même que celle que `_porteur()` compare au moment
+        de présenter. Deux lectures de la même variable ne peuvent pas
+        diverger : le contrôle d'audience était une TAUTOLOGIE, verte quoi
+        qu'il arrive, et le champ `resource` que `/authorize` prend soin
+        d'enregistrer n'était lu par personne.
+
+        Elle vient donc désormais de l'AUTORISATION — le code, puis le jeton de
+        rafraîchissement qui en descend. Ce que le jeton porte est ce pour quoi
+        il a été demandé ; ce que `_porteur()` exige est ce que ce serveur-ci
+        sert. Les deux peuvent différer, donc le contrôle existe.
+        """
         acces, rafraichir = jeton(), jeton()
         maintenant = time.time()
         data["access"][empreinte(acces)] = {
-            "grant_id": grant_id, "scope": scope, "aud": MCP_URL,
+            "grant_id": grant_id, "scope": scope, "aud": aud,
             "exp": maintenant + ACCESS_TTL}
         fin_chaine = chain_exp or (maintenant + REFRESH_TTL)
         data["refresh"][empreinte(rafraichir)] = {
-            "grant_id": grant_id, "scope": scope, "used": False,
+            "grant_id": grant_id, "scope": scope, "used": False, "aud": aud,
             "chain_exp": fin_chaine, "exp": fin_chaine}
         return acces, rafraichir
 
@@ -903,11 +1624,28 @@ class Poignee(BaseHTTPRequestHandler):
         if not verifier or not code:
             return self._json(400, {"error": "invalid_grant",
                                     "error_description": "code et code_verifier requis"})
+        # La FORME du verifier, exigée avant de le hacher, et hors du verrou.
+        #
+        # `encode("ascii", "ignore")` laissait tomber en silence tout caractère
+        # hors ASCII : « abc…def » et « abcdef » se hachaient pareil, donc un
+        # verifier DIFFÉRENT de celui qui avait demandé le code passait le
+        # contrôle. PKCE n'existe que pour prouver ce point-là. La grammaire du
+        # RFC 7636 §4.1 — 43 à 128 caractères non réservés — n'était par
+        # ailleurs vérifiée nulle part : ce qui la respecte est forcément
+        # ASCII, et l'encodage se fait ensuite sans échappatoire.
+        if not re.fullmatch(r"[A-Za-z0-9._~-]{43,128}", verifier):
+            return self._json(400, {"error": "invalid_grant",
+                                    "error_description": "code_verifier mal formé"})
         with _oauth_lock:
-            data = oauth_menage(oauth_load())
+            data, retire = oauth_frais()
             entree = data["codes"].get(empreinte(code))
             if not isinstance(entree, dict):
-                oauth_save(data)
+                # `if retire`, ici et à chaque refus : ce chemin est public et
+                # anonyme, et persister sans que rien n'ait changé donnait une
+                # réécriture complète du PVC par requête — sous le verrou que
+                # /mcp doit prendre pour valider le moindre Bearer.
+                if retire:
+                    oauth_save(data)
                 return self._json(400, {"error": "invalid_grant"})
             if entree.get("used"):
                 # Rejeu détecté : on révoque TOUT ce qui découle de ce code.
@@ -917,19 +1655,26 @@ class Poignee(BaseHTTPRequestHandler):
                                         "error_description": "code déjà utilisé"})
             if (form.get("client_id") != entree.get("client_id")
                     or form.get("redirect_uri") != entree.get("redirect_uri")):
-                oauth_save(data)
+                if retire:
+                    oauth_save(data)
                 return self._json(400, {"error": "invalid_grant"})
             attendu = base64.urlsafe_b64encode(
-                hashlib.sha256(verifier.encode("ascii", "ignore")).digest()
+                hashlib.sha256(verifier.encode("ascii")).digest()
             ).rstrip(b"=").decode()
             if not hmac.compare_digest(attendu, entree.get("code_challenge", "")):
-                oauth_save(data)
+                if retire:
+                    oauth_save(data)
                 return self._json(400, {"error": "invalid_grant",
                                         "error_description": "code_verifier invalide"})
             # Gardé, marqué : c'est l'entrée conservée qui permettra de
             # RECONNAÎTRE un rejeu, au lieu de le prendre pour un code inconnu.
             entree["used"] = True
-            acces, rafraichir = self._emettre(data, entree["grant_id"], entree["scope"])
+            acces, rafraichir = self._emettre(
+                data, entree["grant_id"], entree["scope"],
+                # `or MCP_URL` : un code écrit par la version d'avant n'a pas
+                # d'audience à porter, et déconnecter Claude pour ça serait un
+                # correctif qui coûte plus cher que la faille.
+                entree.get("resource") or MCP_URL)
             durable = oauth_save(data)
         if not durable:
             return self._json(500, {"error": "server_error"})
@@ -943,10 +1688,11 @@ class Poignee(BaseHTTPRequestHandler):
         if not presente:
             return self._json(400, {"error": "invalid_grant"})
         with _oauth_lock:
-            data = oauth_menage(oauth_load())
+            data, retire = oauth_frais()
             entree = data["refresh"].get(empreinte(presente))
             if not isinstance(entree, dict):
-                oauth_save(data)
+                if retire:
+                    oauth_save(data)
                 return self._json(400, {"error": "invalid_grant"})
             if entree.get("used"):
                 # Un jeton de rafraîchissement déjà tourné qui revient : soit il
@@ -959,7 +1705,8 @@ class Poignee(BaseHTTPRequestHandler):
                                         "error_description": "jeton déjà utilisé"})
             grant = data["grants"].get(entree.get("grant_id")) or {}
             if grant.get("revoked"):
-                oauth_save(data)
+                if retire:
+                    oauth_save(data)
                 return self._json(400, {"error": "invalid_grant"})
             # La portée se valide AVANT de consommer le jeton. Sinon un refus
             # brûle un jeton parfaitement valide : l'usage légitime suivant est
@@ -982,10 +1729,19 @@ class Poignee(BaseHTTPRequestHandler):
                 if not voulu:
                     return self._json(400, {"error": "invalid_scope"})
                 scope = " ".join(sorted(voulu))
+            # La PIERRE TOMBALE, et sa péremption. L'entrée reste — c'est elle
+            # qui permettra de reconnaître un rejeu au lieu de le prendre pour
+            # un jeton inconnu — mais elle ne reste plus quatre-vingt-dix
+            # jours : chaque rotation en laissait une, et rien ne les retirait
+            # jamais. Une heure suffit à ce pour quoi elle existe.
             entree["used"] = True
+            tombe = time.time() + TOMBE_TTL
+            entree["exp"] = min(peremption(entree, tombe), tombe)
             acces, neuf = self._emettre(data, entree["grant_id"], scope,
+                                        entree.get("aud") or MCP_URL,
                                         chain_exp=entree.get("chain_exp"))
             grant["last"] = horodate()
+            grant["last_ts"] = time.time()
             durable = oauth_save(data)
         if not durable:
             return self._json(500, {"error": "server_error"})
@@ -1000,8 +1756,8 @@ class Poignee(BaseHTTPRequestHandler):
         aucune donnée fournie par le client, donc rien à afficher plus tard.
         Quatre failles meurent par construction plutôt que par correctif."""
         brut = self._corps_borne(16384)
-        if brut == "trop-gros":
-            return self._json(413, {"error": "invalid_client_metadata"})
+        if isinstance(brut, RefusCorps):
+            return self._refus_corps(brut, en_json=True)
         try:
             demande = json.loads(brut) if brut.strip() else None
         except ValueError:
@@ -1041,42 +1797,128 @@ class Poignee(BaseHTTPRequestHandler):
         """
         if not self._humain_present():
             return self._defi_humain()
+        # Les trois mêmes contrôles que /consent, et pour la même raison : le
+        # credential ambiant que le navigateur rejoue seul sur une soumission
+        # inter-site. /consent les avait, /revoke non — l'écart n'était pas
+        # voulu, et une page hostile coupait d'un POST toutes les autorisations
+        # du connecteur. Une origine OPAQUE reste acceptée, comme là-bas : des
+        # navigateurs l'envoient sur des navigations légitimes.
+        origine = self.headers.get("Origin")
+        if origine and origine != "null" and origine.rstrip("/") != PUBLIC_BASE:
+            return self._send(403, page_refus(
+                "Origine refusée",
+                "Cette soumission annonce venir de %s, et non de ce serveur."
+                % origine[:120]))
+        site = self.headers.get("Sec-Fetch-Site")
+        if site and site not in ("same-origin", "none"):
+            return self._send(403, page_refus(
+                "Soumission inter-site refusée (%s)" % site[:40],
+                "Le mot de passe est rejoué automatiquement par le navigateur : "
+                "une soumission venue d'ailleurs ne prouve rien."))
         form = self._form_stricte()
+        if isinstance(form, RefusCorps):
+            return self._refus_corps(form)
         if form is None:
             return self._send(400, page_refus("Demande mal formée", "Corps illisible."))
         vise = form.get("grant", "")
         with _oauth_lock:
-            data = oauth_menage(oauth_load())
+            # La vraie défense : un jeton à usage unique, émis par la page
+            # elle-même. Il est consommé AVANT de regarder ce qu'on révoque, et
+            # même s'il est périmé — sinon un rejeu le laisserait en place pour
+            # l'essai suivant.
+            if memoire_consommer(_csrf_revoke, empreinte(form.get("csrf", ""))) is None:
+                return self._send(400, page_refus(
+                    "Demande périmée",
+                    "Ce bouton vient d'une page trop ancienne, ou d'ailleurs. "
+                    "Rechargez la page et recommencez ; rien n'a été révoqué."))
+            data, retire = oauth_frais()
             if vise == "tout":
                 for gid in list(data["grants"]):
                     oauth_revoquer(data, gid)
-            elif vise in data["grants"]:
-                oauth_revoquer(data, vise)
-            oauth_save(data)
+                coupe = bool(data["grants"])
+            else:
+                coupe = vise in data["grants"]
+                if coupe:
+                    oauth_revoquer(data, vise)
+            if coupe or retire:
+                oauth_save(data)
         return self._redirect("/")
 
     def _accueil(self):
         if not self._humain_present():
             return self._defi_humain()
+        # Le MÊME contrôle que /authorize, et pour la même raison : cette page
+        # frappe un jeton anti-CSRF dans `_csrf_revoke`, bornée à REVOKE_MAX.
+        # Sans lui, trente-deux chargements hostiles évinçaient le jeton de
+        # Vincent et lui interdisaient de révoquer — le correctif de D5 avait
+        # créé la table sans lui donner sa garde.
+        refus = self._exige_navigation()
+        if refus is not None:
+            return refus
+        csrf = jeton()
         with _oauth_lock:
-            data = oauth_menage(oauth_load())
+            data, _ = oauth_frais()
             vivants = sorted(
                 ((gid, g) for gid, g in data["grants"].items()
                  if isinstance(g, dict) and not g.get("revoked")),
                 key=lambda paire: paire[1].get("created", ""), reverse=True)
-        return self._send(200, page_accueil(vivants), extra=[
+            memoire_poser(_csrf_revoke, empreinte(csrf),
+                          {"exp": time.time() + REVOKE_TTL}, REVOKE_MAX)
+        return self._send(200, page_accueil(vivants, csrf), extra=[
             ("Content-Security-Policy",
              "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
              "frame-ancestors 'none'"),
             ("X-Frame-Options", "DENY")])
 
+    def _whoami(self):
+        """Quel artefact tourne ici — et rien d'autre.
+
+        SANS authentification humaine, délibérément. La question « la
+        production correspond-elle au dépôt ? » se pose depuis l'extérieur,
+        souvent quand quelque chose cloche, et une réponse qu'il faut
+        déverrouiller n'est pas consultée : on suppose à la place, et une
+        supposition coûte plus cher qu'une question. Chez le dépôt voisin, un
+        `ETAT.md` a affirmé pendant des semaines que la prod correspondait au
+        dépôt alors que le ConfigMap servait une variante divergente.
+        Comparer :
+
+            curl -s https://domaines.ephais.eu/_whoami
+            git show HEAD:serveur.py | shasum -a 256
+
+        Ce qui est servi n'apprend rien à qui n'a pas le mot de passe : le
+        code est public, sa version aussi, et l'armement se lit déjà sur la
+        page de consentement de quiconque autorise le connecteur. Ce qui n'y
+        est PAS, et n'y sera pas : le jeton Infomaniak et jusqu'à son existence,
+        le compte épinglé — un numéro de client, qui n'a rien à faire dehors —
+        et toute donnée d'autorisation, codes, jetons, familles ou même leur
+        nombre, qui dirait à un inconnu quand quelqu'un vient de se connecter.
+
+        `marque_proxy` dit seulement si le garde-fou de D1 est armé. Le taire
+        ne protégerait rien — un serveur sans marque REFUSE tout ce qui ne
+        vient pas de lui-même — et l'annoncer donne le seul moyen de constater
+        de dehors qu'un déploiement est bien fermé.
+        """
+        return self._json(200, {
+            "service": infomaniak_mcp.NAME,
+            "version": infomaniak_mcp.VERSION,
+            "code": EMPREINTE_CODE,
+            "fichiers": EMPREINTES_FICHIERS,
+            "public_base": PUBLIC_BASE,
+            "ecriture_armee": infomaniak_mcp.ecriture_armee(),
+            "achat_arme": infomaniak_mcp.achat_arme(),
+            "marque_proxy": bool(MARQUE_PROXY),
+        })
+
     # ---- routage ---------------------------------------------------------
 
     def do_GET(self):
-        chemin = urlparse(self.path).path
+        chemin = chemin_demande(self.path)
 
         if chemin == "/healthz":
             return self._send(200, "ok", "text/plain; charset=utf-8")
+
+        if chemin == "/_whoami":
+            return self._whoami()
 
         if chemin in ("/.well-known/oauth-protected-resource",
                       "/.well-known/oauth-protected-resource/mcp"):
@@ -1107,7 +1949,7 @@ class Poignee(BaseHTTPRequestHandler):
         return self._send(404, page_refus("Introuvable", "Ce chemin n'existe pas."))
 
     def do_POST(self):
-        chemin = urlparse(self.path).path
+        chemin = chemin_demande(self.path)
 
         if chemin == "/mcp":
             return self._mcp()
@@ -1128,7 +1970,7 @@ class Poignee(BaseHTTPRequestHandler):
         return self.do_GET()
 
     def do_DELETE(self):
-        chemin = urlparse(self.path).path
+        chemin = chemin_demande(self.path)
         if chemin == "/mcp":
             # Claude ferme parfois une session par DELETE. Ce transport est sans
             # session : rien à fermer, mais répondre proprement évite qu'un
@@ -1152,6 +1994,18 @@ def main():
         print("ATTENTION : INFOMANIAK_PUBLIC_BASE n'est pas posé ; toutes les "
               "URL publiques vaudront %s, ce qui ne convient qu'en local."
               % PUBLIC_BASE, flush=True)
+
+    if not MARQUE_PROXY:
+        # Le vide alarme, et il alarme fort : sans marque, /, /authorize,
+        # /consent et /revoke ne répondent qu'à la boucle locale. En bac à
+        # sable c'est ce qu'on veut ; en production, personne ne pourra
+        # autoriser Claude, et il faut que la cause tienne dans la première
+        # ligne du journal plutôt que dans une demi-journée de diagnostic.
+        print("ALARME : INFOMANIAK_MARQUE_PROXY n'est pas posé. Les pages "
+              "humaines (/, /authorize, /consent, /revoke) ne s'ouvriront QUE "
+              "depuis la boucle locale — c'est-à-dire à personne, derrière un "
+              "proxy. Poser la même valeur ici et dans le middleware Traefik "
+              "qui écrase l'en-tête %s." % ENTETE_MARQUE, flush=True)
 
     serveur = ThreadingHTTPServer(("", PORT), Poignee)
     serveur.daemon_threads = True
