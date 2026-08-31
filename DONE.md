@@ -14,5 +14,6 @@ adresse valide vers cette ligne.
 | D2 | Le code d'autorisation est persisté en clair dans oauth.json pendant 300 s | `70826bc` | Le code d'autorisation n'est plus persisté en clair dans oauth.json : le fichier ne garde que son empreinte, l'URL de réponse vit dans la table mémoire _grace bornée à 32. Test check_durcissement.py : après un consentement complet, le code émis est cherché dans le fichier d'état et ne s'y trouve pas. |
 | D3 | La fenêtre de grâce de /consent re-livre un code déjà consommé | `70826bc` | La fenêtre de grâce ne re-livre plus un code déjà consommé : l'entrée codes[empreinte] est relue, absente ou used donne 400. Test : recharger /consent après un échange rend un refus, plus le même code. |
 | D4 | Chaque /token anonyme réécrit tout l'état OAuth sur le PVC | `70826bc` | Un /token anonyme ne réécrit plus l'état : oauth_menage rend le nombre d'entrées écartées et les six chemins de refus ne persistent que si le ménage a retiré quelque chose. Mesuré par inode et mtime inchangés sur 23 requêtes. |
+| D5 | `POST /revoke` n'a ni jeton anti-CSRF ni contrôle d'origine | `70826bc` | POST /revoke a désormais son jeton anti-CSRF à usage unique, plus les contrôles Origin et Sec-Fetch-Site, comme /consent. Test : une révocation sans jeton est refusée. |
 
 Fin.
