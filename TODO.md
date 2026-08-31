@@ -14,5 +14,6 @@ Révisé le 2026-08-31.
 
 | # | ID | Sujet | Spec | Décision | Pourquoi ce rang |
 |---|---|---|---|---|---|
+| 1 | D14 | Slowloris sur la phase d'en-têtes : le budget de durée ne couvre que le corps | `docs/specs/2026-08-30-connecteur-claude.md` | Armer une échéance absolue dès l'acceptation de la connexion, couvrant ligne de requête et en-têtes, et lire ces phases contre ce budget. | Le chronomètre est armé APRÈS que BaseHTTPRequestHandler a lu la ligne de requête et tous les en-têtes ; DELAI_CORPS ne borne donc que la lecture du corps. Un client qui distille des octets d'en-tête tient un thread indéfiniment, sans aucun identifiant. Le correctif du second tour est incomplet, et l'auditeur l'a prouvé en socket brute. |
 
 Fin.
