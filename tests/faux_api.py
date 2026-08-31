@@ -56,6 +56,44 @@ def remise_a_zero():
             "force_corps": None,
             "commandes": [],
             "total_menteur": None,
+            "champs_tld": {
+                "app": {
+                    "contacts": [
+                        {"type": "contact_id", "contact_type": r, "required": True}
+                        for r in ("owner", "admin", "tech", "billing")],
+                    "registration": [
+                        {"type": "info", "name": "6a96_illisible", "required": False,
+                         "description": "L'extension .APP requiert HTTPS."},
+                        {"type": "checkbox", "name": "x-accept-ssl-requirement",
+                         "required": True, "pattern": "^1$",
+                         "description": "J'ai lu et compris cette information"}],
+                },
+                "ch": {"contacts": [{"type": "contact_id", "contact_type": "owner",
+                                     "required": True}],
+                       "registration": []},
+                # Relevé sur .fr le 2026-09-01 : un champ requis dont la valeur
+                # ne se DÉDUIT pas — il faut choisir. Il porte des options, un
+                # défaut, et des conditions. C'est le cas qui fait qu'un modèle
+                # « prêt à envoyer » peut être incomplet sans en avoir l'air.
+                "fr": {"contacts": [{"type": "contact_id", "contact_type": r,
+                                     "required": True}
+                                    for r in ("owner", "admin", "tech")],
+                       "registration": [
+                           {"type": "radio", "name": "restricted_publication",
+                            "required": True, "default": "1",
+                            "description": "Masquer le proprietaire dans le Whois",
+                            "options": [{"name": "Oui", "value": "1"},
+                                        {"name": "Non", "value": "0"}],
+                            "required_conditions": [
+                                {"field": "type", "operator": "==",
+                                 "value": "Person", "contact": "owner"}]}]},
+                # Et le cas sans défaut : là, rien ne peut être pré-rempli.
+                "xyz": {"contacts": [{"type": "contact_id", "contact_type": "owner",
+                                      "required": True}],
+                        "registration": [
+                            {"type": "text", "name": "x-siret", "required": True,
+                             "description": "Numero SIRET"}]},
+            },
             "operations": [
                 {"id": "po-1", "amount": 50.0, "currency": "EUR",
                  "status": "payed", "created_at": 1788122771},
@@ -204,6 +242,30 @@ class Poignee(BaseHTTPRequestHandler):
                            "pages": max(1, len(ops) // max(1, par_page) + 1),
                            "items_per_page": par_page, "page": page}
             return self._rend(200, corps_rendu)
+
+        # /2/tld/{tld} — ce que l'extension exige. Reproduit fidèlement la forme
+        # relevée sur .app le 2026-09-01, `with` compris : sa valeur n'est
+        # documentée nulle part, et une valeur inconnue rend un 422 qui
+        # ÉNUMÈRE les valeurs acceptées. C'est ce 422 qui apprend l'API.
+        if len(seg) == 3 and seg[0] == "2" and seg[1] == "tld":
+            tld = seg[2]
+            voulu = [x for x in (params.get("with") or [""])[0].split(",") if x]
+            connus = ["length", "periods", "groups", "transfer_method", "fields",
+                      "is_idn", "idn", "support", "delays"]
+            for v in voulu:
+                if v not in connus:
+                    return self._rend(422, {"result": "error", "error": {
+                        "code": "validation_failed", "description": "Validation failed",
+                        "errors": [{"code": "validation_rule_in",
+                                    "description": "The selected with.0 is invalid.",
+                                    "context": {"attribute": "with.0",
+                                                "values": connus}}]}})
+            data = {"id": 650, "tld": tld}
+            if "periods" in voulu:
+                data["registration_periods"] = list(range(1, 11))
+            if "fields" in voulu:
+                data["fields"] = ETAT.get("champs_tld", {}).get(tld, {"contacts": [], "registration": []})
+            return self._succes(data)
 
         # /2/domains/accounts/{account}/create  — l'enregistrement
         if len(seg) == 5 and seg[:3] == ["2", "domains", "accounts"] and seg[4] == "create":

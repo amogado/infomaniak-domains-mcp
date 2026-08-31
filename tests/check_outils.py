@@ -37,6 +37,16 @@ def ok(condition, quoi):
         ECHECS.append(quoi)
 
 
+def ensembles(obtenu, attendu, quoi):
+    """Comparer des ENSEMBLES, jamais une absence isolée ni un ordre.
+
+    Un test qui compare des listes ordonnées vire au rouge sur un tri qui
+    change ; un test qui vérifie une absence est vert quand rien n'est rendu.
+    L'ensemble dit ce qu'on veut dire."""
+    ok(set(obtenu) == set(attendu),
+       "%s : attendu %r, obtenu %r" % (quoi, sorted(attendu), sorted(obtenu)))
+
+
 def egal(obtenu, attendu, quoi):
     ok(obtenu == attendu, "%s : attendu %r, obtenu %r" % (quoi, attendu, obtenu))
 
@@ -169,9 +179,90 @@ ok("options" in r["reponse"]["action"]["pricing"],
 egal(faux_api.requetes(chemin_contient="/check")[-1]["corps"]["with_option_prices"], True,
      "l'option part bien dans le corps")
 
+# ---- ce que l'extension exige, rendu AVEC la disponibilité ------------------
+# Une fiche de documentation a dû être écrite parce que l'outil savait où
+# trouver ces exigences et ne les disait pas : le champ additionnel du .app, sa
+# forme, et les quatre rôles de contact. Un appelant qui ne sait pas qu'il faut
+# demander ne demande pas — c'est à l'outil de le dire.
+neuf()
+r = ik.outil_disponibilite({"domain": "kiosquier.app"})
+ok("commande" in r, "disponibilité : un bloc « commande » accompagne le prix")
+c = r.get("commande") or {}
+
+egal(c.get("champs_requis"), [{
+        "nom": "x-accept-ssl-requirement", "type": "checkbox",
+        "motif": "^1$", "valeur": "1",
+        "texte": "J'ai lu et compris cette information"}],
+     "les champs REQUIS de l'extension, et eux seuls")
+egal(c.get("additional_fields"), {"x-accept-ssl-requirement": "1"},
+     "un additional_fields prêt à envoyer — c'est ce qui évite de le deviner")
+ensembles(c.get("contacts_requis") or [], ["owner", "admin", "tech", "billing"],
+          "les quatre rôles de contact que .app exige")
+egal(c.get("periodes"), list(range(1, 11)), "les durées offertes")
+ok("objet" in (c.get("forme_additional_fields") or "").lower(),
+   "et l'avertissement sur la FORME : un objet, malgré la spec qui dit tableau")
+
+# Le champ « info » n'est pas une donnée à envoyer : il ne doit pas s'y glisser.
+noms = [x["nom"] for x in c.get("champs_requis") or []]
+ok("6a96_illisible" not in noms,
+   "le champ d'information n'est pas confondu avec un champ à remplir")
+ok("6a96_illisible" not in json.dumps(c.get("additional_fields") or {}),
+   "ni dans le modèle prêt à envoyer")
+
+# ---- un modèle qui n'a PAS l'air complet quand il ne l'est pas -------------
+# Constaté contre la vraie API : .fr exige `restricted_publication`, un choix
+# dont la valeur ne se déduit pas. Un modèle qui l'omet en silence a l'air prêt
+# et fait refuser la commande — c'est un fail-OPEN, exactement ce qu'on refuse
+# ailleurs. Il doit dire ce qui manque.
+r = ik.outil_disponibilite({"domain": "monsite.fr"})
+c = r.get("commande") or {}
+egal(c.get("additional_fields"), {"restricted_publication": "1"},
+     "un champ à choix avec valeur par défaut est pré-rempli avec ce défaut")
+ok(c.get("additional_fields_complet") is True,
+   "et le modèle s'annonce complet, puisque le défaut suffit")
+champ = (c.get("champs_requis") or [{}])[0]
+egal(champ.get("options"), [{"nom": "Oui", "valeur": "1"},
+                            {"nom": "Non", "valeur": "0"}],
+     "les options du choix sont rendues, pour qu'on puisse trancher autrement")
+ok(champ.get("conditionnel") is True,
+   "et le fait qu'il ne soit exigé que sous condition est signalé")
+
+# Sans défaut ni motif contraignant, rien ne peut être pré-rempli : le modèle
+# doit se déclarer INCOMPLET et nommer ce qui manque.
+r = ik.outil_disponibilite({"domain": "monsite.xyz"})
+c = r.get("commande") or {}
+egal(c.get("additional_fields"), {},
+     "un champ dont la valeur ne se déduit pas n'est pas inventé")
+ok(c.get("additional_fields_complet") is False,
+   "le modèle s'annonce INCOMPLET plutôt que de laisser croire qu'il suffit")
+ensembles(c.get("a_renseigner") or [], ["x-siret"],
+          "et il nomme précisément ce qui reste à renseigner")
+
+# Une extension sans champ additionnel ne doit pas inventer un bloc vide
+# trompeur : elle rend une liste vide et un modèle vide, pas l'absence.
+r = ik.outil_disponibilite({"domain": "exemple2.ch"})
+c = r.get("commande") or {}
+egal(c.get("champs_requis"), [], "une extension sans champ requis le dit")
+egal(c.get("additional_fields"), {}, "et rend un modèle vide, pas absent")
+ensembles(c.get("contacts_requis") or [], ["owner"], "avec ses propres contacts")
+
+# Les exigences d'une extension ne changent pas : on ne les redemande pas.
+avant_tld = len(faux_api.requetes(chemin_contient="/2/tld/"))
+ik.outil_disponibilite({"domain": "autre.app"})
+egal(len(faux_api.requetes(chemin_contient="/2/tld/")), avant_tld,
+     "les exigences d'une extension déjà vue ne sont pas redemandées")
+
+# Un domaine PRIS n'a rien à commander : pas de bloc trompeur.
+r = ik.outil_disponibilite({"domain": "exemple.ch"})
+ok("commande" not in r or not r["commande"].get("montant_ht"),
+   "un domaine pris ne porte pas d'instructions de commande")
+
+# Compteur RELATIF : un nombre en dur casse au premier test ajouté au-dessus,
+# et l'échec accuse alors le code au lieu du test.
+avant_check = len(faux_api.requetes(chemin_contient="/check"))
 leve(lambda: ik.outil_disponibilite({"domain": "kiosquier"}), "extension",
      "un nom sans extension est refusé avant l'appel")
-egal(len(faux_api.requetes(chemin_contient="/check")), 4,
+egal(len(faux_api.requetes(chemin_contient="/check")), avant_check,
      "le nom sans extension n'a produit aucun appel réseau")
 
 leve(lambda: ik.outil_disponibilite({}), "domain", "disponibilité sans domaine : refus")

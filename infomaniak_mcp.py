@@ -488,6 +488,114 @@ def outil_disponibilite(args):
     return resume_disponibilite(nom, data)
 
 
+_EXIGENCES_TLD = {}
+
+
+def exigences_tld(tld):
+    """Ce que l'extension exige pour être enregistrée — champs et contacts.
+
+    Retenu par extension : les exigences d'un TLD ne changent pas d'une minute
+    à l'autre, et l'API plafonne à 60 requêtes par minute. Contrôler dix noms
+    de la même extension ne doit pas coûter dix appels de plus.
+
+    La valeur `fields` du paramètre `with` n'est documentée nulle part. On la
+    trouve en envoyant n'importe quoi : le 422 énumère les valeurs acceptées
+    dans `error.errors[].context.values`. C'est le réflexe qui fait gagner le
+    plus de temps sur cette API — lire le corps *complet* d'une erreur de
+    validation, pas seulement son résumé.
+
+    Une lecture qui échoue rend None, pas un dictionnaire vide : « je ne sais
+    pas » et « rien n'est exigé » ne sont pas la même chose, et confondre les
+    deux ferait envoyer une commande incomplète en croyant l'avoir remplie.
+    """
+    tld = (tld or "").strip().lower()
+    if not tld:
+        return None
+    if tld in _EXIGENCES_TLD:
+        return _EXIGENCES_TLD[tld]
+    try:
+        data = appel("/2/tld/" + urllib.parse.quote(tld, safe=""),
+                     params={"with": "fields,periods"})
+    except ErreurInfomaniak:
+        return None
+    _EXIGENCES_TLD[tld] = data if isinstance(data, dict) else None
+    return _EXIGENCES_TLD[tld]
+
+
+def instructions_commande(tld, montant):
+    """De quoi commander sans rien deviner : champs, contacts, durées.
+
+    Cet outil savait où trouver ces exigences et ne les disait pas — au point
+    qu'il a fallu écrire une fiche de documentation pour les transmettre à la
+    main. Un appelant qui ignore qu'il faut demander ne demande pas : c'est à
+    l'outil de le dire, au moment où la question se pose.
+    """
+    data = exigences_tld(tld)
+    if data is None:
+        return None
+    champs_bruts = ((data.get("fields") or {}).get("registration") or [])
+    champs, modele, manquants = [], {}, []
+    for c in champs_bruts:
+        if not isinstance(c, dict) or not c.get("required"):
+            # Un champ « info » porte le texte à AFFICHER, pas une donnée à
+            # envoyer. Le prendre pour un champ à remplir fait refuser la
+            # commande sans qu'on comprenne pourquoi.
+            continue
+        nom_champ = c.get("name")
+        motif = c.get("pattern") or ""
+        entree = {"nom": nom_champ, "type": c.get("type"),
+                  "motif": motif, "texte": c.get("description") or ""}
+        if c.get("note"):
+            entree["note"] = c["note"]
+        options = [{"nom": o.get("name"), "valeur": o.get("value")}
+                   for o in (c.get("options") or []) if isinstance(o, dict)]
+        if options:
+            entree["options"] = options
+        # Certains champs ne sont exigés que sous condition — sur .fr, selon
+        # que le propriétaire est une personne ou une organisation. Le signaler
+        # évite de croire qu'un refus vient d'ailleurs.
+        if c.get("required_conditions"):
+            entree["conditionnel"] = True
+
+        # Une valeur ne se pose que si elle se DÉDUIT : un motif qui n'accepte
+        # qu'elle, ou un défaut annoncé par l'API. Sinon on ne devine pas — un
+        # modèle qui invente est pire qu'un modèle incomplet.
+        valeur = None
+        if motif.startswith("^") and motif.endswith("$") and motif[1:-1].isalnum():
+            valeur = motif[1:-1]
+        elif c.get("default") not in (None, ""):
+            valeur = str(c["default"])
+        if valeur is not None:
+            entree["valeur"] = valeur
+            modele[nom_champ] = valeur
+        elif nom_champ:
+            manquants.append(nom_champ)
+        champs.append(entree)
+
+    contacts = [c.get("contact_type")
+                for c in ((data.get("fields") or {}).get("contacts") or [])
+                if isinstance(c, dict) and c.get("required") and c.get("contact_type")]
+
+    return {
+        "montant_ht": montant,
+        "periodes": data.get("registration_periods"),
+        "contacts_requis": contacts,
+        "champs_requis": champs,
+        "additional_fields": modele,
+        # Le vide alarme : un modèle qui omet un champ requis en silence a
+        # l'air prêt et fait refuser la commande. On dit s'il suffit, et on
+        # nomme ce qui manque.
+        "additional_fields_complet": not manquants,
+        "a_renseigner": manquants,
+        # La spec OpenAPI annonce un tableau de chaînes. C'est faux : l'API
+        # veut un objet nom → valeur, et un tableau laisse le champ requis
+        # non renseigné avec un refus qui ne dit pas lequel.
+        "forme_additional_fields":
+            "additional_fields est un OBJET nom → valeur, malgré la spec "
+            "OpenAPI qui annonce un tableau de chaînes",
+    }
+
+
 def resume_disponibilite(nom, data):
     """Dégager de la réponse ce sur quoi on décide, sans jeter le brut.
 
@@ -522,6 +630,15 @@ def resume_disponibilite(nom, data):
         resume["renouvellement_ht"] = renouvellement["amount_excl_tax"]
     if tarifs.get("registration_periods"):
         resume["periodes_possibles"] = tarifs["registration_periods"]
+
+    # Ce qu'il faut pour commander, tant qu'il y a quelque chose à commander :
+    # un domaine déjà pris ne porte pas d'instructions, sinon on croirait
+    # pouvoir l'acheter.
+    if resume.get("libre") and resume.get("premiere_periode_ht") is not None:
+        instructions = instructions_commande(nom.rsplit(".", 1)[-1],
+                                             resume["premiere_periode_ht"])
+        if instructions is not None:
+            resume["commande"] = instructions
 
     resume["reponse"] = data
     return resume

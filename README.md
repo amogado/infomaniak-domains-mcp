@@ -142,7 +142,7 @@ poignée de main s'il peut écrire ou non.
 | `comptes` | les comptes visibles avec ce jeton |
 | `domaines` | les domaines, filtrables par recherche ou extension |
 | `domaine` | la fiche d'un domaine : expiration, statut, serveurs de noms |
-| `disponibilite` | ce nom est-il libre, et à quel prix — n'engage rien |
+| `disponibilite` | ce nom est-il libre, à quel prix, **et ce que l'extension exige pour le commander** — n'engage rien |
 | `zones` | les zones DNS d'un domaine |
 | `enregistrements` | les enregistrements d'une zone, filtrables par type ou source |
 | `verifie_enregistrement` | l'enregistrement est-il *servi* par les serveurs de noms |
@@ -205,6 +205,14 @@ Cela dit, whois ne donne pas le prix et ne dit pas si le nom est réservable :
 c'est l'outil `disponibilite` qui tranche.
 
 ## Commander un domaine
+
+`disponibilite` rend désormais un bloc `commande` : les contacts requis, les
+durées offertes, les champs propres à l'extension, et un `additional_fields`
+**prêt à envoyer**. Il annonce aussi s'il est complet — un champ dont la valeur
+ne se déduit pas (un choix, un numéro) est nommé dans `a_renseigner` plutôt
+qu'omis en silence. Un modèle qui a l'air prêt sans l'être fait refuser la
+commande sans qu'on comprenne pourquoi.
+
 
 Six obstacles se présentent l'un après l'autre, et l'API ne les révèle qu'un par
 un — portées manquantes, solde prépayé, contacts, champs propres au TLD, cadence
