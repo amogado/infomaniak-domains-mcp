@@ -204,6 +204,16 @@ les serveurs de noms.
 Cela dit, whois ne donne pas le prix et ne dit pas si le nom est réservable :
 c'est l'outil `disponibilite` qui tranche.
 
+## Commander un domaine
+
+Six obstacles se présentent l'un après l'autre, et l'API ne les révèle qu'un par
+un — portées manquantes, solde prépayé, contacts, champs propres au TLD, cadence
+de l'endpoint, montant exact. Ils sont tous décrits, avec leurs codes d'erreur
+et l'appel qui passe, dans **[docs/commander-un-domaine.md](docs/commander-un-domaine.md)**.
+
+Le piège le plus contre-intuitif : **la commande par l'API se paie sur le crédit
+prépayé du compte, jamais sur une carte enregistrée.**
+
 ## L'API en face
 
 Base `https://api.infomaniak.com`, `Authorization: Bearer …`, enveloppe
