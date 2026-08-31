@@ -14,6 +14,5 @@ Révisé le 2026-08-31.
 
 | # | ID | Sujet | Spec | Décision | Pourquoi ce rang |
 |---|---|---|---|---|---|
-| 1 | D6 | `canoniser_ressource()` lève sur un port malformé : /token plante sans réponse | `docs/specs/2026-08-30-connecteur-claude.md` | Attraper le ValueError et le traiter comme une ressource inconnue. | Un chemin public et non authentifié qui coupe la socket et crache une trace de pile dans le journal du pod. Le contrôle d'audience devient une porte de déni de service. |
 
 Fin.
