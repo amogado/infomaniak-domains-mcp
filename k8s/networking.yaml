@@ -1,14 +1,15 @@
 # ---------------------------------------------------------------------------
 # Deux Services vers le MÊME pod, et c'est tout l'intérêt.
 #
-# Le jour où l'authentification humaine passera par un side-car (oauth2-proxy),
-# le Service `infomaniak-domains` pointera vers le port du side-car. Si
-# l'Ingress du connecteur visait encore ce Service, les sept chemins machine se
-# retrouveraient DERRIÈRE l'authentification humaine — et Claude, qui appelle
-# depuis le cloud sans navigateur, ne pourrait plus jamais se connecter.
+# Le jour annoncé est arrivé : l'authentification humaine passe par le side-car
+# oauth2-proxy, et le Service `infomaniak-domains` vise désormais SON port. Si
+# l'Ingress du connecteur visait encore ce Service, les huit chemins machine se
+# retrouveraient DERRIÈRE l'authentification humaine — Claude, qui appelle
+# depuis le cloud sans navigateur, recevrait une page HTML vers Google là où il
+# attend du JSON, et ne pourrait plus jamais se connecter.
 #
-# Les séparer dès maintenant fait qu'une telle bascule ne touche qu'un seul
-# Service, et que check_frontiere.sh dit immédiatement si elle a débordé.
+# Les avoir séparés d'avance fait que la bascule n'a touché qu'un seul Service,
+# et que check_frontiere.sh dit immédiatement si elle a débordé.
 # ---------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
@@ -20,9 +21,18 @@ spec:
     app: infomaniak-domains
   ports:
     - port: 80
-      targetPort: 8080
+      # 4180, et non 8080 : c'est le side-car oauth2-proxy qui répond ici, et
+      # qui relaie vers l'application une fois l'utilisateur revenu de Google.
+      # `/oauth2/start` et `/oauth2/callback` sont servis par lui, sans jamais
+      # atteindre l'application — c'est pour ça qu'ils n'ont aucune route.
+      targetPort: 4180
       protocol: TCP
 ---
+# Le MÊME pod, nommé séparément : la porte de Claude, qui n'a pas de navigateur.
+# Elle garde 8080, c'est-à-dire l'application en direct, sans le side-car. Ce
+# port-ci est la ligne qu'il ne faut jamais aligner sur celui d'au-dessus « par
+# cohérence » : les deux Services diffèrent exprès, et c'est leur seule
+# différence.
 apiVersion: v1
 kind: Service
 metadata:
@@ -36,9 +46,34 @@ spec:
       targetPort: 8080
       protocol: TCP
 ---
+# ---------------------------------------------------------------------------
+# Le Basic Auth — GARDÉ EN PLACE, ET INERTE.
+#
+# Plus aucune route ne le référence : l'authentification humaine est passée au
+# compte Google, dans le side-car. Cet objet ne fait donc rien aujourd'hui, et
+# c'est exactement pour ça qu'il reste — un middleware qu'on supprime est un
+# retour arrière qu'on doit réécrire sous la pression, le soir où Google, le
+# client OAuth ou la liste nominative pose un problème.
+#
+# Le retour arrière, honnêtement : DEUX commandes, pas une.
+#
+#   M=infomaniak-domains-default-infomaniak-domains
+#   kubectl -n infomaniak-domains-default patch svc infomaniak-domains \
+#     --type=json -p '[{"op":"replace","path":"/spec/ports/0/targetPort","value":8080}]'
+#   kubectl -n infomaniak-domains-default annotate ingress infomaniak-domains --overwrite \
+#     "traefik.ingress.kubernetes.io/router.middlewares=$M-auth@kubernetescrd,$M-marque@kubernetescrd"
+#
+# La première seule laisserait le proxy Google devant sans que Traefik demande
+# quoi que ce soit ; la seconde seule empilerait le mot de passe DEVANT Google
+# au lieu de le remplacer. Et l'une comme l'autre est défaite au prochain
+# `./deploy.sh` : le dépôt est la source de vérité, donc un retour arrière qui
+# doit durer se commite ici.
+#
 # Le Secret infomaniak-domains-basicauth n'est PAS dans ce dépôt.
 # Sa création — le mot de passe ne quitte jamais le terminal — est dans
-# deploy.sh, qui refuse de déployer tant qu'il manque.
+# deploy.sh, qui continue d'exiger ce Secret : un Middleware dont le Secret a
+# disparu rend 500, et on l'apprendrait au pire moment, celui du retour arrière.
+# ---------------------------------------------------------------------------
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
@@ -94,16 +129,21 @@ spec:
 # la requête (len != 1) au lieu de lire la copie hostile arrivée en tête. La
 # mauvaise configuration se verrait ; elle ne s'exploiterait pas.
 #
-# ORDRE DES MIDDLEWARES : `-auth` d'abord, `-marque` ensuite. Traefik les
-# applique dans l'ordre de la liste : une requête sans mot de passe est renvoyée
-# par le Basic Auth avant que la marque ne soit posée. L'inverse fonctionnerait
-# aussi, mais poserait la marque sur des requêtes qu'on s'apprête à refuser.
+# IL N'Y A PLUS QU'UN MIDDLEWARE, et l'ancien ordre mérite d'être expliqué
+# plutôt qu'effacé : `-auth` venait d'abord pour qu'une requête sans mot de
+# passe soit renvoyée avant que la marque ne soit posée. Le refus a déménagé
+# dans le pod — oauth2-proxy renvoie vers Google avant de relayer quoi que ce
+# soit à l'application — donc Traefik marque désormais aussi des requêtes qui
+# n'aboutiront pas. Ça ne coûte qu'un en-tête posé pour rien : la marque dit
+# « cette requête a traversé Traefik par la porte humaine », ce qui reste vrai,
+# et elle n'a jamais prétendu dire qui était derrière.
 #
 # SI LE MIDDLEWARE MANQUE : Traefik rend 500 sur les routes humaines. C'est
 # fail-closed, et c'est voulu — appliquer ce fichier à la main sans passer par
 # `deploy.sh` ferme le site, il ne l'ouvre pas sans marque.
 # ---------------------------------------------------------------------------
-# L'Ingress humain : tout le reste du site, derrière Basic Auth ET la marque.
+# L'Ingress humain : tout le reste du site, derrière le compte Google (dans le
+# pod, via le Service qui vise le side-car) ET la marque (ici).
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -113,7 +153,16 @@ metadata:
     # sur un même hôte font deux commandes Let's Encrypt pour un seul
     # certificat, donc deux fois le quota pour rien.
     cert-manager.io/issuer: letsencrypt
-    traefik.ingress.kubernetes.io/router.middlewares: infomaniak-domains-default-infomaniak-domains-auth@kubernetescrd,infomaniak-domains-default-infomaniak-domains-marque@kubernetescrd
+    # PLUS DE `-auth` : le mot de passe partagé a cédé la place au compte
+    # Google. Le Middleware existe toujours, inerte — voir son en-tête, plus
+    # haut, pour le retour arrière.
+    #
+    # `-marque` reste, et il reste SEUL sur cette ligne. C'est lui qui distingue
+    # « arrivé par Traefik, porte humaine » de « joint en direct sur 8080 par un
+    # voisin du cluster » — une distinction que le compte Google ne fait pas :
+    # oauth2-proxy est DANS le pod, donc un voisin qui parle au port 8080 ne le
+    # croise pas plus qu'il ne croisait le Basic Auth.
+    traefik.ingress.kubernetes.io/router.middlewares: infomaniak-domains-default-infomaniak-domains-marque@kubernetescrd
 spec:
   ingressClassName: traefik
   tls:

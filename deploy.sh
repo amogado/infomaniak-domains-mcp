@@ -6,7 +6,7 @@
 # variante ne peut survivre dans le cluster sans être ici.
 #
 # ---------------------------------------------------------------------------
-# Les trois Secrets, à créer UNE FOIS, hors dépôt
+# Les quatre Secrets, à créer UNE FOIS, hors dépôt
 # ---------------------------------------------------------------------------
 #
 # 1. Le jeton d'API Infomaniak. Jamais dans un fichier, jamais dans une sortie
@@ -29,8 +29,13 @@
 #    rejouer. Surtout pas `create --dry-run=client -o yaml | apply`, qui
 #    imprimerait le secret en base64 sur le terminal.
 #
-# 2. Le htpasswd de l'authentification humaine. htpasswd -n demande le mot de
-#    passe sans l'afficher et n'imprime que le condensat :
+# 2. Le htpasswd du Basic Auth. Il ne sert PLUS À RIEN au quotidien : la porte
+#    humaine est passée au compte Google, et plus aucune route ne référence le
+#    Middleware `infomaniak-domains-auth`. On le garde, et ce script continue de
+#    l'exiger, parce qu'il EST le retour arrière (voir k8s/networking.yaml) — un
+#    Middleware dont le Secret a disparu rend 500, et on l'apprendrait le seul
+#    soir où l'on en a besoin. htpasswd -n demande le mot de passe sans
+#    l'afficher et n'imprime que le condensat :
 #
 #      htpasswd -nB vincent \
 #        | kubectl -n infomaniak-domains-default create secret generic \
@@ -60,6 +65,52 @@
 #    redémarre le pod. Les deux côtés changent ensemble parce qu'ils lisent la
 #    même clé ; les tourner séparément fermerait les pages humaines jusqu'au
 #    second geste.
+#
+# 4. Le client OAuth Google — trois valeurs, un seul Secret.
+#
+#    Le client se crée à la main dans la console Google Cloud. Son URI de
+#    redirection doit être EXACTEMENT :
+#
+#      https://domains.mcp.ephais.eu/oauth2/callback
+#
+#    Google compare la chaîne entière : un `/` final, un `www`, un `http`, et le
+#    retour échoue en `redirect_uri_mismatch` — chez Google, donc sans laisser
+#    la moindre trace dans nos journaux.
+#
+#    Les trois clés se posent en UN SEUL geste : un Secret ne se complète pas
+#    après coup sans que la valeur passe par la ligne de commande, donc par
+#    `ps` et par l'historique du shell.
+#
+#      export BW_SESSION=$(bw unlock --raw)        # tapé par Vincent lui-même
+#      kubectl -n infomaniak-domains-default create secret generic \
+#        infomaniak-domains-oauth \
+#        --from-file=client-id=<(bw get username google-oauth-domains --session "$BW_SESSION" | tr -d '\n') \
+#        --from-file=client-secret=<(bw get password google-oauth-domains --session "$BW_SESSION" | tr -d '\n') \
+#        --from-file=cookie-secret=<(python3 -c 'import base64,os,sys; sys.stdout.write(base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("="))')
+#
+#    `<(...)` est une substitution de processus : la valeur passe par un
+#    descripteur de fichier et ne s'arrête nulle part — ni fichier sur disque,
+#    ni argument visible dans `ps`, ni ligne d'historique. `--from-literal`
+#    serait la voie évidente, et c'est la mauvaise, pour ces deux raisons-là.
+#    `/dev/stdin`, employé pour les trois autres Secrets, ne convient pas ici :
+#    l'entrée standard ne se lit qu'une fois, et il faut trois clés.
+#
+#    Le cookie-secret ne vient PAS de Google : c'est ce qui chiffre le cookie de
+#    session, et personne n'a besoin de le connaître. 32 octets de hasard, en
+#    base64 URL-safe sans remplissage — 43 caractères qu'oauth2-proxy redécode
+#    en 32 octets. L'alphabet standard n'est pas un détail : un `+` ou un `/`
+#    risque de faire retomber le décodage sur la chaîne brute, d'une longueur
+#    qu'oauth2-proxy refuse (il lui faut 16, 24 ou 32 octets), et le conteneur
+#    ne démarrerait pas.
+#
+#    Le piège de cette forme : si une commande interne échoue, `kubectl` lit un
+#    tube vide et crée un Secret d'apparence normale et de contenu vide. Les
+#    vérifications ci-dessous refusent ce cas — sans elles, on l'apprendrait par
+#    un pod qui ne démarre plus, donc par un connecteur MCP tombé avec lui.
+#
+#    Pour tourner le client : `kubectl delete secret infomaniak-domains-oauth`,
+#    rejouer, puis `./deploy.sh`. Un cookie-secret neuf invalide toutes les
+#    sessions ouvertes : chacun se reconnecte, rien de plus.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -73,16 +124,36 @@ echo "==> Vérifications"
 # boucle en CrashLoop parce qu'un Secret manque. L'absence tombe du côté qui
 # alarme.
 #
-# `infomaniak-marque-proxy` mérite un mot de plus que les deux autres. Sans lui,
+# `infomaniak-marque-proxy` mérite un mot de plus que les trois autres. Sans lui,
 # le déploiement ne planterait PAS : le pod démarrerait, /healthz répondrait, le
 # connecteur MCP marcherait — et /, /authorize, /consent et /revoke seraient
 # fermés à tout le monde, Vincent compris, parce que `_humain_present()` retombe
 # alors sur la boucle locale. Personne ne pourrait plus autoriser Claude, et
 # rien n'aurait l'air cassé. C'est exactement le genre de panne qu'on paye une
 # demi-journée ; on la refuse ici, en une ligne.
-for s in infomaniak-token infomaniak-domains-basicauth infomaniak-marque-proxy; do
+for s in infomaniak-token infomaniak-domains-basicauth infomaniak-marque-proxy \
+         infomaniak-domains-oauth; do
   if ! $K get secret "$s" >/dev/null 2>&1; then
     echo "   Secret « $s » absent du namespace $NS." >&2
+    echo "   Sa création est documentée en tête de ce fichier." >&2
+    exit 1
+  fi
+done
+
+# Le client Google, clé par clé. Sa création passe par des substitutions de
+# processus (voir le point 4, en tête) : une commande interne qui échoue donne
+# un Secret d'apparence normale et de contenu vide, sans que `kubectl` s'en
+# plaigne.
+#
+# Ce qu'on évite ici mérite d'être dit, parce que ça déborde de la porte
+# humaine : un oauth2-proxy privé de client ou de cookie-secret refuse de
+# démarrer, un conteneur qui ne démarre pas rend le pod non-Ready, et un pod
+# non-Ready perd ses endpoints sur les DEUX Services — celui de Claude compris.
+# Une faute sur la porte des humains couperait la porte des machines. On la
+# refuse avant le rollout, pas après.
+for cle in client-id client-secret cookie-secret; do
+  if [ -z "$($K get secret infomaniak-domains-oauth -o jsonpath="{.data['$cle']}")" ]; then
+    echo "   Le Secret infomaniak-domains-oauth n'a pas de clé « $cle » non vide." >&2
     echo "   Sa création est documentée en tête de ce fichier." >&2
     exit 1
   fi
@@ -147,6 +218,12 @@ $K get secret infomaniak-marque-proxy -o jsonpath='{.data.marque}' \
   | $K apply -f -
 
 echo "==> Manifests"
+# networking.yaml d'abord, donc le Service humain bascule vers le port 4180
+# AVANT que le pod ne porte le side-car qui l'écoute : entre les deux, la porte
+# humaine rend 502. Quelques secondes, et du bon côté — un 502 ne laisse
+# personne entrer. L'ordre inverse ouvrirait la fenêtre symétrique, où le
+# side-car tourne mais où le Service passe encore à côté de lui : la page
+# servie SANS authentification. On préfère fermé à ouvert.
 $K apply -f "$HERE/k8s/networking.yaml"
 # k8s/reseau.yaml n'est PAS appliqué : en l'état il coupe Traefik (502).
 # Voir la dette D13 — le fichier reste au dépôt avec ce qui a été mesuré,
@@ -160,5 +237,11 @@ $K rollout restart deploy/infomaniak-domains
 $K rollout status  deploy/infomaniak-domains --timeout=120s
 
 echo "==> OK — https://domains.mcp.ephais.eu"
+echo "    La porte humaine passe par le compte Google : la première visite part"
+echo "    vers accounts.google.com, et seule la liste nominative de"
+echo "    k8s/deployment.yaml revient. Un 302 vers Google EST le succès."
+echo
 echo "    La frontière ne se vérifie que de l'extérieur, sans mot de passe :"
 echo "    ./tests/check_frontiere.sh https://domains.mcp.ephais.eu"
+echo "    Elle est ce qui dit si le side-car a débordé sur les chemins machine :"
+echo "    du JSON attendu, une page HTML vers Google reçue."

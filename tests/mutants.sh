@@ -502,6 +502,106 @@ mutant "le contrôle d'audience disparaît" \
   '            if entree.get("aud") != MCP_URL:' \
   '            if False:'
 
+# --- la page de configuration ------------------------------------------------
+#
+# Éprouvés contre `tests/check_config.py`, qui a été écrit contre la SPEC et
+# non contre ce code — les deux ont été rédigés en parallèle, exprès. Ces
+# mutants disent la seule chose qu'un test ne peut pas dire de lui-même : qu'il
+# mord. Les dix-huit ont été vus tuer, un par un.
+#
+# Ce qu'ils NE disent pas, et qu'il faut avoir en tête : ils prouvent que les
+# gardes ÉCRITES sont tenues, jamais que rien ne manque. C'est la leçon
+# d'`INFOMANIAK_ACCOUNT`, éprouvé par 43 mutants dont aucun ne survivait, et
+# qui avait deux trous.
+
+# la frontière humaine, élargie à l'identité que pose oauth2-proxy
+mutant "le canari n'accepte plus l'identité transmise par oauth2-proxy" \
+  $'        if self._identite():\n            return True' \
+  $'        if False:\n            return True'
+
+mutant "un en-tête d'identité présent mais VIDE vaut identité" \
+  '        return "".join(c for c in recus[0].strip() if c.isprintable())[:200]' \
+  '        return "".join(c for c in recus[0].strip() if c.isprintable())[:200] or "personne"'
+
+mutant "/config s'ouvre sans identité humaine" \
+  $'        if not self._humain_present():\n            return self._defi_humain()\n        # Le même contrôle que /authorize' \
+  $'        # Le même contrôle que /authorize'
+
+mutant "la page de configuration perd son contrôle de navigation" \
+  $'        refus = self._exige_navigation()\n        if refus is not None:\n            return refus\n        q = self._query_stricte() or {}' \
+  $'        q = self._query_stricte() or {}'
+
+# le jeton anti-CSRF — exigé, et à usage unique
+mutant "le jeton anti-CSRF de /config n'est plus exigé" \
+  $'        if not self._config_jeton_csrf(form):\n            return self._config_perime()' \
+  $'        if False:\n            return self._config_perime()' \
+  1
+
+mutant "le jeton anti-CSRF de /config resservirait indéfiniment" \
+  $'            return memoire_consommer(\n                _csrf_config, empreinte(form.get("csrf", ""))) is not None' \
+  $'            return memoire_lire(\n                _csrf_config, empreinte(form.get("csrf", ""))) is not None'
+
+# le fichier : son mode, et son autorité sur l'environnement
+mutant "le fichier de réglages devient lisible par tous" \
+  '            os.fchmod(fd, 0o600)' \
+  '            os.fchmod(fd, 0o644)'
+
+mutant "le fichier ne fait plus autorité : l'environnement reprend la main" \
+  $'    return ({nom: data[nom] for nom in NOMS_REGLAGES\n             if nom in data and data[nom] is not None}, "lu")' \
+  '    return {}, "absent"'
+
+mutant "une variable d'amorçage ne sert plus de départ" \
+  '    return _AMORCE["ecriture_armee"]()' \
+  '    return False'
+
+# le secret : jamais rendu, jamais effacé par mégarde
+mutant "la page rend le secret en entier" \
+  '            % (len(valeur), valeur[-4:], empreinte(valeur)[:12]))' \
+  '            % (len(valeur), valeur, empreinte(valeur)[:12]))'
+
+mutant "un envoi vide efface le jeton" \
+  $'        propose = (form.get("jeton") or "").strip()\n        if propose:' \
+  $'        propose = (form.get("jeton") or "").strip()\n        if True:'
+
+mutant "/_whoami rend le jeton d'API" \
+  '            "marque_proxy": bool(MARQUE_PROXY),' \
+  '            "marque_proxy": bool(MARQUE_PROXY), "jeton": infomaniak_mcp.jeton(),'
+
+mutant "/_whoami annonce l'armement d'AMORÇAGE, pas l'effectif" \
+  '            "ecriture_armee": infomaniak_mcp.ecriture_armee(),' \
+  '            "ecriture_armee": _AMORCE["ecriture_armee"](),'
+
+# le journal : borné, nominatif, et muet sur les valeurs
+mutant "le journal garde cent mille entrées" \
+  'JOURNAL_MAX = 128          #' \
+  'JOURNAL_MAX = 100000       #'
+
+mutant "le journal n'inscrit plus qui a fait le changement" \
+  '            journalise = journal_ajouter(self._qui(), sorted(change)) if durable else False' \
+  '            journalise = journal_ajouter("", sorted(change)) if durable else False'
+
+mutant "le journal inscrit la VALEUR du réglage au lieu de l'identité" \
+  '            journalise = journal_ajouter(self._qui(), sorted(change)) if durable else False' \
+  '            journalise = journal_ajouter(str(change), sorted(change)) if durable else False'
+
+# le plafond de dépense : illisible ⇒ refus, jamais le défaut
+#
+# Le premier de ces trois mutants remet la faille que `check_config.py` a
+# trouvée en naissant : `float("1e400")` rend l'infini, `float("nan")` rend
+# nan, et `<= 0` est faux pour les deux. Un plafond qui n'est pas un montant
+# autorisait donc n'importe quel montant.
+mutant "un plafond infini ou « nan » repasse pour un montant" \
+  '    if not math.isfinite(nombre):' \
+  '    if False:'
+
+mutant "un plafond nul ou négatif est accepté" \
+  '    if nombre <= 0:' \
+  '    if False:'
+
+mutant "un plafond illisible retombe sur le défaut au lieu de refuser" \
+  $'    except ValueError:\n        raise ErreurInfomaniak(\n            "le plafond de dépense vaut %r, qui n\'est pas un nombre. Aucune "' \
+  $'    except ValueError:\n        return infomaniak_mcp.ACHAT_MAX_DEFAUT\n        raise ErreurInfomaniak(\n            "le plafond de dépense vaut %r, qui n\'est pas un nombre. Aucune "'
+
 # ===========================================================================
 # tests/run.sh — le lanceur lui-même
 # ===========================================================================

@@ -5,7 +5,35 @@
 # ConfigMap. « Déployer » = réappliquer un ConfigMap et redémarrer le pod, ce
 # qui garde le dépôt comme seule source de vérité — il n'existe pas d'image
 # intermédiaire capable de diverger de lui.
+#
+# Trois objets : la liste des humains admis, le Deployment, et le volume où vit
+# l'état OAuth. La liste vient en premier — voir son en-tête.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Qui a le droit d'entrer par la porte humaine — une adresse par ligne.
+#
+# C'est la SEULE chose qui sépare « un compte Google » de « ce compte-ci » :
+# oauth2-proxy sait vérifier une signature Google, il ne sait pas qui vous êtes.
+# Le fichier tient donc tout le pouvoir de la porte, et il tient dans un objet
+# qu'on peut relire d'un coup d'oeil.
+#
+# Il est EN TÊTE de ce fichier, et ce n'est pas cosmétique : `kubectl apply -f`
+# applique les documents dans leur ordre, et un pod qui monte un ConfigMap
+# absent reste en ContainerCreating jusqu'à ce qu'il apparaisse.
+#
+# Pour ajouter quelqu'un : cette ligne-ci, puis `./deploy.sh`. Le rollout est ce
+# qui rend le changement certain — oauth2-proxy sait relire ce fichier à chaud,
+# mais rien ici ne l'a mesuré à travers le remplacement d'un ConfigMap, et une
+# porte qu'on croit ouverte alors qu'elle est fermée coûte une soirée.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: infomaniak-domains-allowlist
+data:
+  emails: |
+    vi.doyon@gmail.com
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -150,6 +178,117 @@ spec:
             # besoin dès qu'il ouvre un fichier temporaire.
             - name: tmp
               mountPath: /tmp
+        # ------------------------------------------------------------------
+        # L'authentification humaine, par compte Google.
+        #
+        # Un side-car plutôt qu'un client OIDC écrit à la main : les sessions,
+        # les cookies, le rafraîchissement et la révocation sont ce qu'on écrit
+        # mal quand on l'écrit soi-même — et ce dépôt a déjà un serveur
+        # d'autorisation à défendre, celui du connecteur. Un second, écrit pour
+        # ouvrir une page de réglages, serait une seconde surface à auditer
+        # pour un gain nul.
+        #
+        # Il n'écoute QUE pour le Service `infomaniak-domains`. Le Service
+        # `infomaniak-domains-direct` continue de viser le port 8080 de ce
+        # conteneur-ci : c'est ce qui garde les huit chemins machine hors de
+        # cette authentification. Claude appelle depuis le cloud, sans
+        # navigateur — une redirection vers Google lui rendrait du HTML là où
+        # il attend du JSON, et le connecteur tomberait sans qu'aucune de nos
+        # pages n'ait l'air cassée. C'est le piège nº 2 du domaine ; il ne se
+        # vérifie que du dehors : tests/check_frontiere.sh.
+        #
+        # CE QUE CE SIDE-CAR COUPLE, et qu'il vaut mieux savoir avant : un pod
+        # n'est Ready que si TOUS ses conteneurs le sont. Un oauth2-proxy qui
+        # refuse de démarrer retire donc les endpoints des DEUX Services, celui
+        # de Claude compris. C'est fail-closed — rien ne s'ouvre — mais ça veut
+        # dire qu'une faute de configuration ici se paye aussi sur le chemin
+        # machine. D'où les vérifications de deploy.sh, en amont du rollout.
+        # ------------------------------------------------------------------
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
+          args:
+            - --provider=google
+            - --http-address=0.0.0.0:4180
+            # La boucle locale du pod : le trafic humain traverse le proxy,
+            # puis franchit le même port 8080 que le chemin machine. Une seule
+            # application, deux portes — pas deux copies à faire diverger.
+            - --upstream=http://127.0.0.1:8080
+            # Cette URL doit être RECOPIÉE À L'IDENTIQUE dans le client OAuth
+            # Google. Google compare la chaîne entière, sans indulgence : un
+            # `www`, un `/` final, un `http` et le retour de Google échoue avec
+            # `redirect_uri_mismatch` — côté Google, donc invisible dans nos
+            # journaux.
+            - --redirect-url=https://domains.mcp.ephais.eu/oauth2/callback
+            # La liste nominative, et rien d'autre.
+            #
+            # On ne pose PAS `--email-domain=*`, que le voisin porte : le
+            # fichier suffit à la validation de configuration d'oauth2-proxy
+            # (le refus « missing setting for email validation » ne tombe que
+            # si les DEUX manquent), et l'étoile n'est pas un filtre de plus —
+            # c'est une autorisation générale posée à côté d'une liste d'une
+            # ligne. Rien ici n'a mesuré laquelle des deux l'emporte ; on ne
+            # pose donc pas celle qui, si elle gagne, veut dire « tout compte
+            # Google du monde ». L'absence tombe du côté qui alarme.
+            - --authenticated-emails-file=/etc/oauth2/emails
+            # Le cookie de session : jamais en clair sur le réseau, pas envoyé
+            # sur une requête inter-site autre qu'une navigation de premier
+            # niveau, et une semaine de validité — assez pour ne pas se
+            # reconnecter à chaque visite, assez court pour qu'un poste perdu
+            # cesse d'ouvrir la page.
+            - --cookie-secure=true
+            - --cookie-samesite=lax
+            - --cookie-expire=168h
+            # L'identité de l'humain, transmise à l'application.
+            #
+            # Le canari de serveur.py devra l'accepter EN PLUS de la marque de
+            # proxy : aujourd'hui il ne connaît que la marque, et la page de
+            # configuration serait fermée à l'instant même où elle devient
+            # atteignable. La spec le dit ; ce fichier-ci ne pose que le
+            # drapeau, il ne peut pas garantir l'autre moitié.
+            - --set-xauthrequest=true
+            # Pas d'écran intermédiaire « se connecter avec Google » : un clic
+            # de moins, et rien à décider pour l'utilisateur.
+            - --skip-provider-button=true
+          env:
+            # Secret HORS DÉPÔT, comme les trois autres. Sa création — sans que
+            # la valeur traverse un fichier ni une sortie lisible : voir
+            # deploy.sh, qui refuse de déployer tant qu'il manque ou qu'une de
+            # ses trois clés est vide.
+            - name: OAUTH2_PROXY_CLIENT_ID
+              valueFrom: {secretKeyRef: {name: infomaniak-domains-oauth, key: client-id}}
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom: {secretKeyRef: {name: infomaniak-domains-oauth, key: client-secret}}
+            # Ce qui chiffre le cookie de session. Il ne vient pas de Google :
+            # on le tire du hasard, et personne ne le lit jamais.
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom: {secretKeyRef: {name: infomaniak-domains-oauth, key: cookie-secret}}
+          # Le pod porte déjà runAsNonRoot, l'uid 1000 et le profil seccomp.
+          # On les réécrit ici quand même : le profil PodSecurity « restricted »
+          # se juge conteneur par conteneur, et un side-car ajouté plus tard en
+          # recopiant celui-ci hériterait sinon d'une sécurité invisible dans
+          # son propre bloc.
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - containerPort: 4180
+              protocol: TCP
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {cpu: 200m, memory: 128Mi}
+          readinessProbe:
+            httpGet: {path: /ping, port: 4180}
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          volumeMounts:
+            - name: allowlist
+              mountPath: /etc/oauth2
+              readOnly: true
       volumes:
         - name: app
           configMap:
@@ -159,6 +298,9 @@ spec:
             claimName: infomaniak-domains-data
         - name: tmp
           emptyDir: {}
+        - name: allowlist
+          configMap:
+            name: infomaniak-domains-allowlist
 ---
 # L'état OAuth : codes émis, jetons, familles de rafraîchissement.
 #

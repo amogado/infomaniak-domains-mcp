@@ -22,7 +22,9 @@ Configuration propre à ce transport :
                              on croit.
     INFOMANIAK_DATA          le répertoire d'état, /data par défaut. C'est un
                              volume : un code d'autorisation non persisté est
-                             un code rejouable indéfiniment.
+                             un code rejouable indéfiniment. C'est aussi là que
+                             vivent `config.json` — les réglages, en 0600 — et
+                             `journal.json`, qui dit qui a changé quoi.
     INFOMANIAK_REDIRECTS     les adresses de retour acceptées, séparées par des
                              virgules. Égalité stricte, jamais de préfixe.
     INFOMANIAK_MARQUE_PROXY  le secret partagé avec Traefik, sans lequel aucune
@@ -35,9 +37,15 @@ Configuration propre à ce transport :
                              `_humain_present()`.
 
 La configuration de l'API (jeton, compte épinglé, armements) est celle de
-`infomaniak_mcp` et n'est pas redite ici. Le jeton Infomaniak ne traverse
-jamais ce transport : Claude reçoit un jeton d'accès **de ce serveur**, qui
-n'ouvre que les outils, et le secret Infomaniak reste dans le conteneur.
+`infomaniak_mcp` — ce fichier n'en invente aucune, il ajoute seulement une
+COUCHE devant : `/data/config.json` fait autorité dès qu'il existe, et les
+variables d'environnement deviennent des valeurs d'AMORÇAGE. Voir « la couche
+de réglages » plus bas pour l'ordre de résolution et pour pourquoi le
+remplacement se fait ici plutôt que là-bas.
+
+Le jeton Infomaniak ne traverse jamais ce transport : Claude reçoit un jeton
+d'accès **de ce serveur**, qui n'ouvre que les outils, et le secret Infomaniak
+reste dans le conteneur.
 
 Ce qu'on refuse, sans exception — chaque point vient de la couche éprouvée de
 kiosquier, où il a son test :
@@ -56,6 +64,7 @@ import hashlib
 import hmac
 import html
 import json
+import math
 import os
 import re
 import secrets
@@ -82,6 +91,8 @@ PUBLIC_BASE = os.environ.get("INFOMANIAK_PUBLIC_BASE", "").rstrip("/") \
 MCP_URL = PUBLIC_BASE + "/mcp"
 DATA_DIR = os.environ.get("INFOMANIAK_DATA", "/data")
 OAUTH_PATH = os.path.join(DATA_DIR, "oauth.json")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+JOURNAL_PATH = os.path.join(DATA_DIR, "journal.json")
 
 # La marque que seul le proxy peut produire. Le nom de l'en-tête est une
 # constante du module pour qu'un test l'IMPORTE au lieu de le recopier : deux
@@ -90,6 +101,11 @@ OAUTH_PATH = os.path.join(DATA_DIR, "oauth.json")
 # vert.
 ENTETE_MARQUE = "X-Infomaniak-Proxy"
 MARQUE_PROXY = os.environ.get("INFOMANIAK_MARQUE_PROXY", "").strip()
+
+# L'identité que pose oauth2-proxy une fois le compte Google vérifié. Elle est
+# la SECONDE façon de prouver qu'un humain est là — voir `_humain_present()`
+# pour ce qu'elle vaut, et à quelle condition elle vaut quelque chose.
+ENTETE_IDENTITE = "X-Auth-Request-Email"
 
 CLIENT_ID = "infomaniak-domains-claude"
 ALLOWED_REDIRECTS = tuple(
@@ -166,6 +182,7 @@ DELAI_CORPS = _delai_corps()
 PENDING_MAX = 64
 GRACE_MAX = 32
 REVOKE_MAX = 32
+CONFIG_MAX = 32
 # La quatrième : les autorisations abouties. Elle est haute parce que /consent
 # vit derrière la frontière humaine — la cadence y est celle d'un humain, pas
 # celle d'un inondeur. Elle existe quand même : une péremption borne l'état
@@ -187,6 +204,7 @@ _oauth_lock = threading.Lock()
 # fenêtre de grâce et le jeton de /revoke devront changer aussi.
 _grace = {}            # empreinte(csrf) -> {"reponse": url, "exp": …}
 _csrf_revoke = {}      # empreinte(jeton) -> {"exp": …}
+_csrf_config = {}      # empreinte(jeton) -> {"exp": …}
 
 # Les chemins qui sortent de l'authentification humaine, énumérés ici pour que
 # le dépôt et l'Ingress se lisent l'un contre l'autre. Le serveur ne s'en sert
@@ -373,6 +391,333 @@ def oauth_frais():
     l'appelant ne peut que persister à l'aveugle."""
     data = oauth_load()
     return data, oauth_menage(data)
+
+
+# --------------------------------------------------------------------------
+# la couche de réglages — le fichier tranche, l'environnement amorce
+# --------------------------------------------------------------------------
+#
+# **L'ordre de résolution, une fois pour toutes : fichier > variable
+# d'environnement > défaut du module.**
+#
+# Ce qui fait fonctionner ce connecteur — jeton d'API, compte épinglé,
+# armements, plafond — vivait dans des variables d'environnement, donc dans un
+# Deployment : changer le jeton demandait une commande à tuyau, armer
+# l'écriture demandait de patcher un objet Kubernetes. Une configuration que
+# seul celui qui l'a écrite sait rejouer n'est pas une configuration, c'est une
+# mémoire personnelle.
+#
+# Elle passe donc sur le volume, dans `config.json`, en 0600 — et les variables
+# deviennent des valeurs d'AMORÇAGE : elles servent au premier démarrage, puis
+# le fichier fait autorité dès qu'il existe. Le fichier tranche **y compris
+# pour dire « rien »** : un compte vide dans le fichier dépingle, même si
+# `INFOMANIAK_ACCOUNT` est posé. Sans cela, on ne pourrait jamais défaire par
+# la page ce qu'une variable a fait.
+#
+# Ce que ce choix coûte, écrit ici plutôt que découvert plus tard : un Secret
+# Kubernetes n'est pas chiffré, il est encodé en base64 — qui peut faire
+# `kubectl get secret` dans ce namespace lit déjà le jeton. Le volume ne change
+# rien pour cet adversaire-là ; il ajoute UNE exposition, les instantanés et
+# sauvegardes de volume. Le prix est assumé. Et **pas de chiffrement maison** :
+# dix lignes écrites avec la seule bibliothèque standard fabriqueraient la
+# faille suivante.
+
+JOURNAL_MAX = 128          # entrées gardées ; les plus anciennes s'effacent
+
+# Le nom, la variable qui l'amorce, et le libellé montré à l'humain. Cette
+# table est la seule liste des réglages : la page, l'écriture, le journal et la
+# résolution s'en servent tous, si bien qu'un réglage ajouté ici apparaît
+# partout, et qu'aucun des quatre ne peut se désynchroniser des trois autres.
+REGLAGES = (
+    ("jeton", "INFOMANIAK_TOKEN", "Jeton d'API Infomaniak"),
+    ("compte", "INFOMANIAK_ACCOUNT", "Compte épinglé"),
+    ("ecriture", "INFOMANIAK_WRITE", "Écriture DNS armée"),
+    ("achat", "INFOMANIAK_ACHAT", "Enregistrement de domaine armé"),
+    ("plafond", "INFOMANIAK_ACHAT_MAX", "Plafond de dépense, en euros HT"),
+)
+NOMS_REGLAGES = tuple(nom for nom, _, _ in REGLAGES)
+LIBELLE_REGLAGE = {nom: libelle for nom, _, libelle in REGLAGES}
+AMORCE_REGLAGE = {nom: env for nom, env, _ in REGLAGES}
+
+_config_lock = threading.Lock()
+
+
+def _vrai(valeur):
+    """Ce qui vaut « armé ». Tout le reste vaut « pas armé », y compris ce
+    qu'on ne comprend pas : un armement est ce qui autorise un geste
+    irréversible, il ne se déduit pas d'une valeur qu'on n'a pas su lire."""
+    if isinstance(valeur, bool):
+        return valeur
+    return str(valeur).strip().lower() in ("1", "oui", "yes", "true")
+
+
+def config_lire():
+    """Les réglages du fichier, et l'ÉTAT de la lecture. Jamais d'exception.
+
+    Trois états, et ils ne veulent pas dire la même chose :
+
+      - `absent` — il n'y a pas de fichier : l'amorçage tranche, c'est le cas
+        du premier démarrage et celui de tous les bancs d'essai ;
+      - `lu` — le fichier existe et se lit : il tranche ;
+      - `illisible` — il existe et ne se lit pas. Ce n'est PAS « absent ».
+        Retomber alors sur l'environnement ré-armerait en silence ce que la
+        page a désarmé : le vide tombe donc du côté qui alarme, et les
+        armements valent « non armés » tant qu'on ne sait pas les lire.
+    """
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}, "absent"
+    except (OSError, ValueError):
+        return {}, "illisible"
+    if not isinstance(data, dict):
+        return {}, "illisible"
+    return ({nom: data[nom] for nom in NOMS_REGLAGES
+             if nom in data and data[nom] is not None}, "lu")
+
+
+def reglage(nom):
+    """La valeur posée par le fichier pour ce réglage, et l'état de la lecture.
+
+    Rend `(None, état)` quand le fichier ne dit rien : c'est à l'appelant de
+    retomber sur l'amorçage, parce que lui seul sait ce que « ne rien dire »
+    signifie pour son réglage.
+
+    Relu à CHAQUE appel, sans cache. Un cache ferait exister une fenêtre où la
+    page affirme une chose et l'outil en fait une autre — pour économiser la
+    lecture d'un fichier de quelques centaines d'octets, sur un volume déjà
+    monté. Le prix du cache dépasse ce qu'il achète.
+    """
+    valeurs, etat = config_lire()
+    if etat == "illisible":
+        return None, etat
+    return valeurs.get(nom), etat
+
+
+def _ecrire_0600(chemin, charge):
+    """Écrit un JSON en 0600, atomiquement. Rend False si rien n'a pu l'être.
+
+    Deux propriétés, et chacune ferme une fenêtre :
+
+    **Le mode est posé AVANT le contenu.** `os.open` crée le temporaire en
+    0600, `os.replace` déplace cet inode-là : il n'existe aucun instant où le
+    secret est sur le disque en lisible-par-tous. Poser le mode après avoir
+    écrit laisserait cette fenêtre — brève, et suffisante.
+
+    **L'écriture est atomique.** Une coupure au milieu laisserait sinon un
+    fichier tronqué, c'est-à-dire un réglage à moitié appliqué : le pire des
+    trois états possibles, parce qu'il a l'air normal.
+
+    Contrairement à `save_state()` du dépôt voisin, cette fonction n'avale pas
+    son échec en silence : l'appelant DOIT regarder ce qu'elle rend. Un réglage
+    qu'on croit enregistré et qui ne l'est pas se découvre au pire moment.
+    """
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = chemin + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            # Ceinture : `os.open` masque son mode par l'umask, et un
+            # temporaire laissé par une exécution d'avant garde le sien.
+            os.fchmod(fd, 0o600)
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
+        with fh:
+            # `allow_nan=False` : la seconde barrière, indépendante de celle du
+            # formulaire. `json.dump` écrit sinon « Infinity » et « NaN », que
+            # la norme JSON ne connaît pas — un fichier qu'aucun autre outil ne
+            # relira, et que notre propre `config_lire()` prendrait pour bon.
+            # Elle lève ; l'appelant lit un échec d'écriture, ce qui est
+            # exactement ce qu'il s'est passé.
+            json.dump(charge, fh, indent=1, sort_keys=True, ensure_ascii=False,
+                      allow_nan=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, chemin)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def config_ecrire(valeurs):
+    """Persiste les réglages. Appelée SOUS `_config_lock`."""
+    return _ecrire_0600(CONFIG_PATH, valeurs)
+
+
+def journal_lire():
+    """Le journal, du plus ancien au plus récent. Jamais d'exception : un
+    journal illisible est une gêne, pas une panne — et il ne doit surtout pas
+    empêcher de corriger le réglage qu'on venait corriger."""
+    try:
+        with open(JOURNAL_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [e for e in data if isinstance(e, dict)][-JOURNAL_MAX:]
+
+
+def journal_ajouter(qui, noms):
+    """Inscrit un changement : QUOI a changé, QUAND, et sous quelle identité.
+
+    **Jamais la valeur.** Le nom du réglage suffit à répondre à la seule
+    question que ce journal existe pour répondre — « qui a armé la dépense, et
+    quand ? » —, et une valeur journalisée serait un secret de plus sur le
+    volume, dans un fichier que rien ne protège aussi bien que le premier.
+
+    Borné à `JOURNAL_MAX` : un journal qui grandit sans fin sur un volume est
+    la même panne que les tables OAuth non purgées, avec la même issue — un pod
+    OOMKillé qui relit le même fichier au redémarrage, donc remeurt.
+    """
+    entree = {"quand": horodate(), "qui": qui,
+              "quoi": [n for n in noms if n in NOMS_REGLAGES]}
+    return _ecrire_0600(JOURNAL_PATH, (journal_lire() + [entree])[-JOURNAL_MAX:])
+
+
+# --------------------------------------------------------------------------
+# … et son branchement sur les fonctions qui existent déjà
+# --------------------------------------------------------------------------
+#
+# Les cinq fonctions ci-dessous REMPLACENT celles d'`infomaniak_mcp`, à
+# l'import de ce module. C'est laid, et c'est le seul branchement possible :
+# `infomaniak_mcp` ne peut pas importer ce fichier — c'est ce fichier qui
+# l'importe. Un module tiers partagé serait plus propre le jour où les deux
+# transports auront besoin de la couche ; aujourd'hui, un seul en a besoin.
+#
+# Car c'est bien un choix, et pas un pis-aller : `/data` n'existe que dans le
+# conteneur. Sur stdio — un `infomaniak_mcp.py` lancé à la main sur un poste —
+# la couche ne s'installe pas, et les variables d'environnement restent seules
+# maîtresses. C'est ce qu'on veut : personne n'a envie qu'un serveur local
+# tienne ses réglages dans un fichier de la machine.
+#
+# Le contrat des cinq fonctions ne bouge pas : mêmes noms, mêmes arguments,
+# mêmes types de retour, mêmes refus. Sans fichier — le cas de tous les bancs
+# d'essai, qui pointent `INFOMANIAK_DATA` sur un dossier jetable — elles font
+# exactement ce qu'elles faisaient.
+
+# Capturées AVANT le remplacement : ce sont elles qui portent l'amorçage, et
+# c'est sur elles qu'on retombe quand le fichier ne dit rien. Les rappeler par
+# `getattr(infomaniak_mcp, …)` ferait s'appeler la version remplacée, donc une
+# récursion sans fin.
+_AMORCE = {nom: getattr(infomaniak_mcp, nom) for nom in (
+    "jeton", "compte_epingle", "ecriture_armee", "achat_arme", "plafond_achat")}
+
+
+def jeton_regle():
+    """Le jeton d'API : celui du fichier, sinon celui de l'amorçage.
+
+    Un fichier illisible retombe sur l'amorçage plutôt que de refuser : un
+    jeton n'autorise rien par lui-même — les armements décident de cela, et eux
+    se ferment — et rendre le serveur muet compliquerait la réparation sans
+    rien protéger.
+    """
+    valeur, _ = reglage("jeton")
+    if valeur is not None:
+        return str(valeur).strip()
+    return _AMORCE["jeton"]()
+
+
+def compte_regle():
+    """Le compte épinglé. Une chaîne vide dans le fichier veut dire « aucun »,
+    et cela l'emporte sur `INFOMANIAK_ACCOUNT` : le fichier tranche aussi quand
+    il tranche pour rien."""
+    valeur, _ = reglage("compte")
+    if valeur is not None:
+        return str(valeur).strip() or None
+    return _AMORCE["compte_epingle"]()
+
+
+def ecriture_reglee():
+    valeur, etat = reglage("ecriture")
+    if etat == "illisible":
+        return False
+    if valeur is not None:
+        return _vrai(valeur)
+    return _AMORCE["ecriture_armee"]()
+
+
+def achat_regle():
+    valeur, etat = reglage("achat")
+    if etat == "illisible":
+        return False
+    if valeur is not None:
+        return _vrai(valeur)
+    return _AMORCE["achat_arme"]()
+
+
+def plafond_regle():
+    """Le plafond en euros HT, ou un refus.
+
+    Illisible **refuse** au lieu de retomber sur un défaut commode — la règle
+    d'`infomaniak_mcp`, tenue telle quelle ici : un contrôle qui autorise une
+    dépense doit se fermer quand il ne se comprend pas lui-même. Un fichier
+    qu'on n'a pas su lire relève du même refus, pour la même raison.
+    """
+    valeur, etat = reglage("plafond")
+    if etat == "illisible":
+        raise ErreurInfomaniak(
+            "le fichier de réglages %s est illisible : aucune commande n'est "
+            "passée tant qu'on ne sait pas quel plafond s'applique." % CONFIG_PATH)
+    if valeur is None:
+        return _AMORCE["plafond_achat"]()
+    return plafond_lisible(valeur)
+
+
+def plafond_lisible(valeur):
+    """Le plafond, lu — ou le refus qu'il mérite. Partagée par la résolution et
+    par le formulaire, pour qu'on ne puisse pas enregistrer un plafond que la
+    commande refusera ensuite de lire."""
+    try:
+        nombre = float(str(valeur).strip().replace(",", "."))
+    except ValueError:
+        raise ErreurInfomaniak(
+            "le plafond de dépense vaut %r, qui n'est pas un nombre. Aucune "
+            "commande n'est passée tant que le plafond est illisible." % (valeur,))
+    # `float()` ne dit pas non à tout ce qui n'est pas un nombre : « 1e400 »
+    # devient l'infini et « nan » devient nan. Or `inf <= 0` est faux et
+    # `nan <= 0` est faux aussi : le seul contrôle qui existait les laissait
+    # tous les deux passer, c'est-à-dire qu'un plafond qui n'est PAS un montant
+    # autorisait n'importe quel montant. `json.dump` écrivait par-dessus
+    # « Infinity », que la norme JSON ne connaît pas.
+    if not math.isfinite(nombre):
+        raise ErreurInfomaniak(
+            "le plafond de dépense vaut %r, qui n'est pas un montant fini. "
+            "Aucune commande n'est passée tant que le plafond est illisible."
+            % (valeur,))
+    if nombre <= 0:
+        raise ErreurInfomaniak(
+            "le plafond de dépense vaut %s : un plafond nul ou négatif "
+            "n'autorise aucune commande." % nombre)
+    return nombre
+
+
+def oublier_les_caches():
+    """Ce qu'`infomaniak_mcp` a retenu de l'ancien réglage, jeté.
+
+    Deux caches de module y vivent : le compte deviné, et les DOMAINES du
+    compte épinglé. Le second sert à un contrôle qui AUTORISE — « ce domaine
+    relève-t-il du compte ? ». Le laisser en place après un changement de jeton
+    ferait répondre ce contrôle depuis un monde qui n'existe plus : le compte
+    n'a pas bougé, mais ce que le jeton y voit, si.
+    """
+    infomaniak_mcp._COMPTE["valeur"] = None
+    infomaniak_mcp._DOMAINES_DU_COMPTE.clear()
+
+
+def installer_reglages():
+    """Branche la couche. Idempotente — `_AMORCE` a été capturé une fois."""
+    infomaniak_mcp.jeton = jeton_regle
+    infomaniak_mcp.compte_epingle = compte_regle
+    infomaniak_mcp.ecriture_armee = ecriture_reglee
+    infomaniak_mcp.achat_arme = achat_regle
+    infomaniak_mcp.plafond_achat = plafond_regle
+
+
+installer_reglages()
 
 
 # --------------------------------------------------------------------------
@@ -612,6 +957,29 @@ td,th{text-align:left;padding:.4rem .6rem;border-bottom:1px solid #dedad2}
 p.pied{color:#78756e;font-size:.82rem;margin:1.6rem 0 0}
 """
 
+# La feuille de la page de configuration. Séparée pour que la première reste
+# celle des trois pages qui existaient avant — et CONCATÉNÉE en argument du
+# %-formatting, jamais posée dans la chaîne de format : le « 100% » de la
+# largeur d'un champ y casserait le rendu, comme c'est déjà arrivé dans le
+# dépôt voisin.
+CSS_CONFIG = """
+fieldset{border:1px solid #dedad2;border-radius:8px;margin:0 0 1.1rem;padding:.9rem 1rem}
+legend{padding:0 .4rem;font-size:.9rem;color:#6d6a63}
+fieldset.depense{border-color:#c98a5e;background:#f6e3d8;color:#8a3f16}
+@media (prefers-color-scheme:dark){
+fieldset.depense{background:#2e2019;border-color:#7a4a26;color:#e0a077}}
+label.ligne{display:block;margin:.6rem 0 .2rem;font-size:.92rem}
+input[type=text],input[type=password],input[type=number],select{
+font:inherit;width:100%;box-sizing:border-box;padding:.45rem .6rem;
+border:1px solid #dedad2;border-radius:6px;background:#fff;color:#1e1e1c}
+@media (prefers-color-scheme:dark){
+input[type=text],input[type=password],input[type=number],select{
+background:#1d1e1c;border-color:#3a3a36;color:#e8e6e1}}
+p.aide{color:#78756e;font-size:.82rem;margin:.35rem 0 0}
+p.source{color:#78756e;font-size:.78rem;margin:.35rem 0 0}
+p.valeur{margin:0;font-size:.92rem}
+"""
+
 LIBELLES = {
     SCOPE_LIRE: "lire vos domaines, vos zones DNS, leurs enregistrements, vos "
                 "contacts et le solde du compte prépayé",
@@ -738,10 +1106,281 @@ def page_accueil(grants, csrf):
 %s
 <p class="pied">Révoquer coupe d'un coup tous les jetons issus d'une même
 autorisation — Claude redemandera votre accord. Le jeton d'API Infomaniak reste
-dans ce conteneur : il n'est jamais remis à Claude, ni journalisé.</p>
+dans ce conteneur : il n'est jamais remis à Claude, ni journalisé.
+<a href="/config">Régler le connecteur</a> — jeton, compte épinglé, armements.</p>
 </div></body></html>""" % (CSS, html.escape(MCP_URL), html.escape(etat_armement()),
                            html.escape(porteur), html.escape(epingle or "aucun"),
                            len(tri[SCOPE_LIRE]), len(tri[SCOPE_ECRIRE]), table))
+
+
+# --------------------------------------------------------------------------
+# la page de configuration
+# --------------------------------------------------------------------------
+
+# Le vocabulaire FERMÉ des messages qu'une redirection peut demander. La page
+# est servie après un 303, et ce qui vient de la barre d'adresse n'est jamais
+# réaffiché : seule une clé de cette table peut choisir un message, dont le
+# texte est écrit ici. Un paramètre inconnu ne rend rien du tout.
+MESSAGES_CONFIG = {
+    "enregistre": "Réglages enregistrés. Le détail de ce qui a changé est au "
+                  "bas de cette page ; les valeurs, elles, ne sont journalisées "
+                  "nulle part.",
+    "inchange": "Rien n'a changé : le formulaire renvoyait les réglages déjà en "
+                "place. Un champ « jeton » laissé vide ne remplace jamais le "
+                "jeton posé.",
+    "muet": "Réglages enregistrés, MAIS le journal n'a pas pu être écrit : ce "
+            "changement-ci ne laissera donc aucune trace de qui l'a fait. Un "
+            "armement de dépense sans auteur est une question sans réponse — à "
+            "regarder avant d'armer quoi que ce soit.",
+}
+
+
+def empreinte_secret(valeur):
+    """Ce qu'on montre d'un secret : de quoi le RECONNAÎTRE, jamais de quoi
+    s'en servir.
+
+    Présence, longueur, quatre derniers caractères, empreinte tronquée. Assez
+    pour distinguer deux jetons et vérifier qu'on a posé le bon ; inutile à qui
+    le vole. C'est la SEULE fonction du programme qui regarde un secret pour
+    l'afficher — la relire suffit donc à vérifier qu'aucune page ne le rend.
+
+    Un jeton très court ne montre pas sa fin : quatre caractères sur huit, ce
+    n'est plus un repère, c'est la moitié du secret.
+    """
+    valeur = (valeur or "").strip()
+    if not valeur:
+        return "absent — aucun outil ne pourra répondre"
+    if len(valeur) < 12:
+        return ("présent — %d caractères (trop court pour en montrer la fin), "
+                "empreinte %s" % (len(valeur), empreinte(valeur)[:12]))
+    return ("présent — %d caractères, finit par « %s », empreinte %s"
+            % (len(valeur), valeur[-4:], empreinte(valeur)[:12]))
+
+
+def comptes_visibles():
+    """Les comptes que le jeton voit, pour la liste déroulante.
+
+    Passe par `appel()` — le client HTTP partagé, sa cadence, ses messages
+    d'erreur — et NON par l'outil `comptes`, qui borne sa réponse à
+    l'épinglage. Le filtre de l'outil a sa raison : Claude n'a pas à apprendre
+    l'existence des comptes voisins. Ici l'audience est le propriétaire du
+    serveur, celui-là même qui CHOISIT l'épinglage, et une liste filtrée par
+    l'épinglage ferait de l'épinglage une porte à sens unique — une fois posé,
+    plus rien d'autre à choisir, donc plus moyen d'en sortir par la page.
+    """
+    comptes = infomaniak_mcp.appel("/1/accounts") or []
+    vus = []
+    for compte in comptes if isinstance(comptes, list) else []:
+        if not isinstance(compte, dict):
+            continue
+        identifiant = compte.get("id") or compte.get("account_id")
+        if identifiant is None:
+            continue
+        vus.append((str(identifiant), str(compte.get("name") or "sans nom")))
+    return vus
+
+
+def vue_config(comptes=None, comptes_erreur=""):
+    """Ce que la page a besoin de savoir — les valeurs EFFECTIVES, celles que
+    les outils appliqueraient à cet instant, et non ce que le fichier contient.
+
+    C'est la distinction qui compte : afficher le contenu du fichier tairait ce
+    qu'un armement d'environnement autorise encore là où le fichier se tait.
+    La provenance de chaque réglage est montrée à côté, pour qu'on sache
+    laquelle des deux couches a parlé.
+    """
+    valeurs, etat = config_lire()
+    vue = {
+        "etat_fichier": etat,
+        "source": {nom: ("fichier" if nom in valeurs else
+                         "amorçage (%s)" % AMORCE_REGLAGE[nom])
+                   for nom in NOMS_REGLAGES},
+        "secret": empreinte_secret(infomaniak_mcp.jeton()),
+        "compte": infomaniak_mcp.compte_epingle(),
+        "comptes": comptes,
+        "comptes_erreur": comptes_erreur,
+        "ecriture": infomaniak_mcp.ecriture_armee(),
+        "achat": infomaniak_mcp.achat_arme(),
+        "journal": journal_lire()[-12:][::-1],
+    }
+    try:
+        vue["plafond"] = "%g" % plafond_regle()
+        vue["plafond_erreur"] = ""
+    except ErreurInfomaniak as err:
+        vue["plafond"] = ""
+        vue["plafond_erreur"] = str(err)
+    return vue
+
+
+def _options_compte(vue):
+    """La liste déroulante des comptes — jamais un champ libre.
+
+    Taper un identifiant à la main est exactement l'erreur qui a fait lister
+    les domaines d'un tiers. On ne propose donc que ce que l'API a montré.
+
+    Le compte épinglé qui n'apparaît PAS dans cette liste garde quand même son
+    option, marquée comme telle : sans elle, ouvrir la page avec un jeton qui
+    ne voit plus ce compte, puis enregistrer, dépinglerait en silence — un
+    formulaire ne doit pas défaire ce qu'on n'a pas touché.
+    """
+    courant = vue["compte"] or ""
+    connus = list(vue["comptes"] or [])
+    lignes = ['<option value=""%s>aucun — ce serveur ne serait borné à aucun '
+              'compte</option>' % ("" if courant else " selected")]
+    for identifiant, nom in connus:
+        lignes.append('<option value="%s"%s>%s — %s</option>' % (
+            html.escape(identifiant, quote=True),
+            " selected" if identifiant == courant else "",
+            html.escape(identifiant), html.escape(nom)))
+    if courant and courant not in [i for i, _ in connus]:
+        lignes.append('<option value="%s" selected>%s — épinglé, mais absent de '
+                      'ce que voit le jeton actuel</option>'
+                      % (html.escape(courant, quote=True), html.escape(courant)))
+    return "".join(lignes)
+
+
+def _bloc_journal(vue):
+    entrees = [e for e in vue["journal"] if isinstance(e, dict)]
+    if not entrees:
+        return "<p>Aucun changement journalisé.</p>"
+    rangees = "".join(
+        '<tr><td class="mono">%s</td><td>%s</td><td>%s</td></tr>' % (
+            html.escape(str(entree.get("quand", ""))),
+            html.escape(str(entree.get("qui", ""))),
+            html.escape(", ".join(
+                LIBELLE_REGLAGE.get(nom, str(nom))
+                for nom in (entree.get("quoi") or [])
+                if isinstance(nom, str)) or "—"))
+        for entree in entrees)
+    return ("<table><tr><th>quand</th><th>qui</th><th>quoi</th></tr>%s</table>"
+            % rangees)
+
+
+def _bloc_epreuve(epreuve):
+    """Ce que l'API a répondu à une lecture, rendu tel quel.
+
+    « J'ai collé quelque chose » et « ça marche » ne sont pas la même chose, et
+    trois jetons ont été perdus en une soirée faute de pouvoir les distinguer.
+    """
+    if not epreuve:
+        return ""
+    if epreuve.get("erreur"):
+        return ('<p class="alerte">Épreuve du jeton : l\'API a refusé. %s</p>'
+                % html.escape(epreuve["erreur"]))
+    comptes = epreuve.get("comptes") or []
+    detail = ", ".join("%s (%s)" % (i, n) for i, n in comptes) or "aucun"
+    domaines = epreuve.get("domaines")
+    if domaines is None:
+        phrase = ("Aucun compte n'est épinglé : le nombre de domaines n'a pas "
+                  "été compté.")
+    else:
+        phrase = "Le compte épinglé porte %d domaine(s)." % domaines
+    return ('<p class="cible">Épreuve du jeton : l\'API a répondu. '
+            'Comptes visibles : %s. %s</p>'
+            % (html.escape(detail), html.escape(phrase)))
+
+
+def page_config(csrf, vue, message="", epreuve=None):
+    """La page de configuration. Derrière l'identité humaine, comme /consent.
+
+    **Aucun champ n'est pré-rempli d'un secret.** Le champ du jeton est vide à
+    chaque affichage, et un envoi vide ne change rien. Réafficher un secret le
+    déposerait dans le cache du navigateur, dans le gestionnaire de mots de
+    passe et dans la mémoire de la page — trois endroits d'où il ne se retire
+    plus.
+
+    L'armement de dépense est dans un cadre à part, teinté, qui dit ce qu'il
+    autorise et jusqu'à quel montant. Une bascule qui coûte de l'argent ne doit
+    pas ressembler aux deux autres.
+    """
+    marque = '<input type="hidden" name="csrf" value="%s">' % html.escape(
+        csrf, quote=True)
+    banniere = ('<p class="cible">%s</p>' % html.escape(message)) if message else ""
+    alarme_fichier = ""
+    if vue["etat_fichier"] == "illisible":
+        alarme_fichier = (
+            '<p class="alerte">Le fichier de réglages existe et ne se lit pas. '
+            'Les armements sont donc tenus pour DÉSARMÉS, et le plafond de '
+            'dépense refuse : on ne devine pas un réglage qui autorise un geste '
+            'irréversible. Enregistrer depuis cette page réécrira le fichier.</p>')
+    liste = ('<p class="alerte">La liste des comptes n\'a pas pu être lue : %s. '
+             'Seul le compte déjà épinglé reste proposé — on ne remplace pas une '
+             'liste manquante par un champ libre.</p>' % html.escape(
+                 vue["comptes_erreur"])) if vue["comptes_erreur"] else ""
+    plafond_dit = ('<p class="aide">Plafond illisible : %s</p>'
+                   % html.escape(vue["plafond_erreur"])) if vue["plafond_erreur"] else ""
+
+    return ("""<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Configurer — domaines Infomaniak</title><style>%s</style></head><body>
+<div class="boite">
+<h1>Configurer le connecteur</h1>
+<p>Les réglages vivent dans <code>%s</code>, en 0600 sur le volume. Le fichier
+fait autorité dès qu'il existe ; les variables d'environnement ne servent plus
+qu'à l'amorçage. La provenance de chaque réglage est indiquée sous lui.</p>
+%s%s%s%s
+<form method="post" action="/config" class="reglages" autocomplete="off">
+%s
+<fieldset><legend>Jeton d'API Infomaniak</legend>
+<p class="valeur">%s</p>
+<label class="ligne" for="jeton">Remplacer par</label>
+<input id="jeton" type="password" name="jeton" value="" autocomplete="new-password"
+ spellcheck="false" placeholder="collez un nouveau jeton, ou laissez vide">
+<p class="aide">Le champ est vide à chaque affichage et un envoi vide ne change
+rien : un secret réaffiché entre dans le cache du navigateur et dans le
+gestionnaire de mots de passe, d'où il ne se retire plus.</p>
+<p class="source">source : %s</p>
+</fieldset>
+<fieldset><legend>Compte épinglé</legend>
+<select name="compte">%s</select>
+<p class="aide">Une liste, jamais un champ libre : un identifiant tapé à la main
+est ce qui a fait lister les domaines d'un tiers. L'épinglage est une frontière
+— les outils refusent tout ce qui n'en relève pas.</p>
+<p class="source">source : %s</p>
+</fieldset>
+<fieldset><legend>Écriture DNS</legend>
+<label><input type="checkbox" name="ecriture" value="1"%s> Armer l'écriture DNS</label>
+<p class="aide">Autorise la création, la modification et la suppression
+d'enregistrements DNS, et le changement des serveurs de noms. Une zone est
+visible de tout le réseau, et une erreur ne se voit qu'une fois faite.</p>
+<p class="source">source : %s</p>
+</fieldset>
+<fieldset class="depense"><legend>Dépense</legend>
+<label><input type="checkbox" name="achat" value="1"%s> Armer l'enregistrement de
+domaine</label>
+<p class="aide">Ceci autorise une DÉPENSE RÉELLE : enregistrer un domaine débite
+le compte prépayé Infomaniak et ne s'annule pas. L'armement est distinct de
+celui de l'écriture DNS, exprès.</p>
+<label class="ligne" for="plafond">Plafond par commande, en euros hors taxes</label>
+<input id="plafond" type="number" name="plafond" step="0.01" min="0.01" value="%s">
+<p class="aide">Un plafond illisible, nul ou négatif refuse toute commande : un
+contrôle qui autorise une dépense se ferme quand il ne se comprend pas lui-même.</p>
+%s
+<p class="source">source : %s ; %s</p>
+</fieldset>
+<div class="rangee"><button class="oui" type="submit">Enregistrer</button></div>
+</form>
+<form method="post" action="/config/eprouver" class="rangee">
+%s
+<button class="non" type="submit">Éprouver le jeton</button>
+</form>
+<p class="aide">L'épreuve appelle l'API en LECTURE et rend ce qu'elle voit :
+les comptes, et le nombre de domaines du compte épinglé. Elle n'écrit rien.</p>
+<h2>Ce qui a changé</h2>
+%s
+<p class="pied">Le journal retient le NOM du réglage, la date et l'identité
+Google — jamais la valeur. Il est borné à %d entrées ; au-delà, les plus
+anciennes s'effacent. <a href="/">Retour à « Connecter Claude »</a></p>
+</div></body></html>""" % (
+        CSS + CSS_CONFIG, html.escape(CONFIG_PATH), banniere, alarme_fichier,
+        liste, _bloc_epreuve(epreuve), marque,
+        html.escape(vue["secret"]), html.escape(vue["source"]["jeton"]),
+        _options_compte(vue), html.escape(vue["source"]["compte"]),
+        " checked" if vue["ecriture"] else "", html.escape(vue["source"]["ecriture"]),
+        " checked" if vue["achat"] else "",
+        html.escape(vue["plafond"], quote=True), plafond_dit,
+        html.escape(vue["source"]["achat"]), html.escape(vue["source"]["plafond"]),
+        marque, _bloc_journal(vue), JOURNAL_MAX))
 
 
 def redirection_erreur(redirect_uri, erreur, state, description=""):
@@ -1111,7 +1750,43 @@ class Poignee(BaseHTTPRequestHandler):
         fonctionner ; en production, où rien n'arrive par la boucle locale,
         tout est refusé. Une variable oubliée rend donc le connecteur
         inutilisable et visiblement cassé, jamais ouvert en silence.
+
+        **La seconde façon d'entrer : une identité, posée par oauth2-proxy.**
+        `X-Auth-Request-Email` porte le compte Google que le proxy vient de
+        vérifier. Une page de configuration derrière un compte Google n'a pas
+        d'autre canari : le jour de la bascule, la marque de Traefik peut fort
+        bien avoir disparu du chemin, et un canari qui n'accepte qu'elle rendrait
+        la page inatteignable au moment précis où l'on en a besoin.
+
+        Ce que cette seconde porte vaut — dit franchement, parce qu'elle vaut
+        moins que la première : un en-tête ne prouve rien par lui-même. Il ne
+        vaut que si TOUT chemin vers ce port traverse un proxy qui l'ÉCRASE.
+        C'est vrai de la marque parce que le middleware Traefik l'écrase ; ce
+        sera vrai de l'identité quand oauth2-proxy sera devant. Entre les deux,
+        et tant que le port 8080 reste joignable depuis le cluster sans
+        traverser le proxy, un voisin qui écrit cet en-tête entre. La marque,
+        elle, reste infalsifiable : c'est pourquoi on ne la retire pas.
+
+        Un en-tête POSÉ MAIS VIDE ne vaut pas identité — c'est ce que pose un
+        proxy qui n'a authentifié personne, et le lire comme « quelqu'un est
+        là » serait exactement l'erreur inverse de celle qu'on corrige.
         """
+        # L'identité ne REMPLACE pas la marque : elle s'y ajoute.
+        #
+        # La version d'avant acceptait `X-Auth-Request-Email` seul, et c'était
+        # un trou réel : le pod écoute sur 8080, joignable depuis le cluster
+        # sans traverser ni Traefik ni oauth2-proxy — un voisin qui écrit cet
+        # en-tête atteignait /config, donc posait le jeton d'API et armait la
+        # dépense. La NetworkPolicy qui fermerait ce chemin est une dette dont
+        # la cause est établie mais qui n'est pas refermable ici : flannel
+        # masque l'adresse source avant que la policy ne la regarde.
+        #
+        # En production les deux arrivent ensemble : Traefik pose la marque à
+        # l'entrée, oauth2-proxy la transmet en amont avec l'identité. Exiger
+        # la marque ne ferme donc aucune porte légitime — et referme celle-ci.
+        #
+        # `_identite()` reste lue, mais pour JOURNALISER qui agit, jamais pour
+        # décider s'il a le droit.
         if not MARQUE_PROXY:
             return self._boucle_locale()
         recus = self.headers.get_all(ENTETE_MARQUE) or []
@@ -1119,6 +1794,36 @@ class Poignee(BaseHTTPRequestHandler):
             return False
         return hmac.compare_digest(empreinte(recus[0].strip()),
                                    empreinte(MARQUE_PROXY))
+
+    def _identite(self):
+        """L'identité Google transmise par le proxy, ou "".
+
+        En un seul exemplaire, comme la marque : si le proxy AJOUTAIT au lieu
+        d'écraser, une copie hostile arriverait en tête et serait celle que
+        `get()` rend. On refuse le doublon pour qu'une mauvaise configuration
+        se voie plutôt qu'elle ne s'exploite.
+
+        Le texte est réduit à ce qui s'imprime et borné : il finit dans un
+        fichier journal, puis sur une page. L'échappement le rend inoffensif à
+        l'affichage ; le borner ici évite qu'un en-tête de trente kilo-octets
+        devienne une ligne de journal de trente kilo-octets.
+        """
+        recus = self.headers.get_all(ENTETE_IDENTITE) or []
+        if len(recus) != 1:
+            return ""
+        return "".join(c for c in recus[0].strip() if c.isprintable())[:200]
+
+    def _qui(self):
+        """De quoi remplir la colonne « qui » du journal.
+
+        Jamais vide, et jamais faussement précis : sans identité transmise, on
+        écrit ce qu'on sait réellement — que la requête a franchi la marque, ou
+        qu'elle vient du conteneur. Un journal qui invente un nom d'utilisateur
+        ne répond plus à la question qu'il existe pour répondre.
+        """
+        return (self._identite()
+                or ("marque de proxy, sans identité" if MARQUE_PROXY
+                    else "boucle locale, sans identité"))
 
     def _defi_humain(self):
         """401, et il dit LEQUEL des deux cas s'est produit.
@@ -1889,6 +2594,249 @@ class Poignee(BaseHTTPRequestHandler):
              "frame-ancestors 'none'"),
             ("X-Frame-Options", "DENY")])
 
+    # ---- la page de configuration ----------------------------------------
+
+    CSP_CONFIG = [("Content-Security-Policy",
+                   "default-src 'none'; style-src 'unsafe-inline'; "
+                   "form-action 'self'; frame-ancestors 'none'"),
+                  ("X-Frame-Options", "DENY")]
+
+    def _garde_soumission(self):
+        """Les deux ceintures d'une soumission humaine. None si elle passe.
+
+        Les mêmes que /consent et /revoke, pour la même raison : l'identité qui
+        ouvre ces pages est un credential AMBIANT — un mot de passe rejoué par
+        le navigateur, un cookie de session posé par oauth2-proxy — que le
+        navigateur présente tout seul sur une soumission venue d'ailleurs. Une
+        origine opaque (« null ») reste acceptée : des navigateurs l'envoient
+        sur des navigations légitimes, et la refuser bloquerait la page pour de
+        bon. La vraie défense reste le jeton à usage unique.
+        """
+        origine = self.headers.get("Origin")
+        if origine and origine != "null" and origine.rstrip("/") != PUBLIC_BASE:
+            return self._send(403, page_refus(
+                "Origine refusée",
+                "Cette soumission annonce venir de %s, et non de ce serveur."
+                % origine[:120]))
+        site = self.headers.get("Sec-Fetch-Site")
+        if site and site not in ("same-origin", "none"):
+            return self._send(403, page_refus(
+                "Soumission inter-site refusée (%s)" % site[:40],
+                "L'identité est rejouée automatiquement par le navigateur : "
+                "une soumission venue d'ailleurs ne prouve rien."))
+        return None
+
+    def _liste_des_comptes(self):
+        """(liste, erreur) — jamais une exception, jamais un champ libre.
+
+        Une API injoignable ne doit pas rendre la page inutilisable : les
+        autres réglages se règlent quand même, et le compte épinglé garde son
+        option. C'est le seul comportement qui ne transforme pas une panne de
+        réseau en dépinglage accidentel.
+        """
+        try:
+            return comptes_visibles(), ""
+        except ErreurInfomaniak as err:
+            return None, str(err)
+        except Exception as err:                          # noqa: BLE001
+            return None, "%s: %s" % (type(err).__name__, err)
+
+    def _rendre_config(self, message="", epreuve=None, code=200,
+                       comptes=None, comptes_erreur=""):
+        """Rend la page, avec un jeton anti-CSRF frais. JAMAIS sous verrou :
+        elle en prend un elle-même, et `_oauth_lock` n'est pas réentrant.
+
+        La liste des comptes se lit ici quand l'appelant n'en a pas déjà une :
+        un affichage de la page en vaut un autre, y compris celui qui suit un
+        refus. Sans cela, corriger une erreur de plafond rendrait une liste
+        déroulante vide, et l'utilisateur croirait avoir perdu ses comptes au
+        moment même où on lui dit que quelque chose ne va pas.
+        """
+        if comptes is None and not comptes_erreur:
+            comptes, comptes_erreur = self._liste_des_comptes()
+        csrf = jeton()
+        with _oauth_lock:
+            memoire_poser(_csrf_config, empreinte(csrf),
+                          {"exp": time.time() + REVOKE_TTL}, CONFIG_MAX)
+        vue = vue_config(comptes, comptes_erreur)
+        return self._send(code, page_config(csrf, vue, message, epreuve),
+                          extra=self.CSP_CONFIG)
+
+    def _config(self):
+        """La page de configuration, en lecture."""
+        if not self._humain_present():
+            return self._defi_humain()
+        # Le même contrôle que /authorize et /, et pour la même raison : cette
+        # page frappe un jeton dans une table de 32 places. Trente-deux
+        # chargements en arrière-plan évinceraient celui de Vincent, au moment
+        # précis où il vient régler quelque chose.
+        refus = self._exige_navigation()
+        if refus is not None:
+            return refus
+        q = self._query_stricte() or {}
+        # Vocabulaire fermé : ce qui vient de la barre d'adresse choisit un
+        # message écrit ici, il n'en devient jamais un.
+        message = MESSAGES_CONFIG.get(q.get("fait", ""), "")
+        return self._rendre_config(message=message)
+
+    def _config_jeton_csrf(self, form):
+        """Consomme le jeton à usage unique. True s'il était bon.
+
+        Consommé AVANT de regarder quoi que ce soit d'autre, et même périmé —
+        sinon un rejeu le laisserait en place pour l'essai suivant.
+        """
+        with _oauth_lock:
+            return memoire_consommer(
+                _csrf_config, empreinte(form.get("csrf", ""))) is not None
+
+    def _config_perime(self):
+        return self._send(400, page_refus(
+            "Demande périmée",
+            "Ce formulaire vient d'une page trop ancienne, ou d'ailleurs. "
+            "Rechargez /config et recommencez ; aucun réglage n'a été touché."))
+
+    def _config_poster(self):
+        """Enregistre les réglages. Le seul chemin qui écrit `config.json`.
+
+        Ce qu'on n'écrit PAS est aussi important que ce qu'on écrit : seuls les
+        réglages RÉELLEMENT modifiés entrent dans le fichier. Recopier au
+        passage tout ce que l'environnement amorce y graverait le jeton
+        d'`INFOMANIAK_TOKEN_CMD` — un secret qu'on avait justement pris soin de
+        garder hors des fichiers — au premier clic sur « Enregistrer ».
+        """
+        if not self._humain_present():
+            return self._defi_humain()
+        refus = self._garde_soumission()
+        if refus is not None:
+            return refus
+        form = self._form_stricte()
+        if isinstance(form, RefusCorps):
+            return self._refus_corps(form)
+        if form is None:
+            return self._send(400, page_refus("Demande mal formée", "Corps illisible."))
+        if not self._config_jeton_csrf(form):
+            return self._config_perime()
+
+        comptes, erreur_comptes = None, ""
+        change = {}
+
+        # Le jeton. Un envoi vide ne change rien — c'est le corollaire de « le
+        # champ est toujours vide » : sans cette règle, afficher la page puis
+        # l'enregistrer effacerait le secret.
+        propose = (form.get("jeton") or "").strip()
+        if propose:
+            if not (8 <= len(propose) <= 512) or any(
+                    c.isspace() or not c.isprintable() for c in propose):
+                return self._rendre_config(
+                    message="Ce jeton n'a pas la forme d'un jeton : espaces, "
+                            "caractères de contrôle, ou longueur invraisemblable. "
+                            "Rien n'a été enregistré.",
+                    code=400, comptes=comptes, comptes_erreur=erreur_comptes)
+            if propose != infomaniak_mcp.jeton():
+                change["jeton"] = propose
+
+        # Le compte. Il ne se VALIDE que s'il change : sans cela, une API
+        # injoignable interdirait de régler l'armement, qui n'a rien à voir.
+        voulu = (form.get("compte") or "").strip()
+        if voulu != (infomaniak_mcp.compte_epingle() or ""):
+            comptes, erreur_comptes = self._liste_des_comptes()
+            if voulu and comptes is None:
+                return self._rendre_config(
+                    message="Le compte n'a pas été changé : la liste des comptes "
+                            "n'a pas pu être lue, et on n'épingle pas un compte "
+                            "qu'on n'a pas vu. Rien n'a été enregistré.",
+                    code=400, comptes=comptes, comptes_erreur=erreur_comptes)
+            if voulu and voulu not in [i for i, _ in comptes]:
+                return self._rendre_config(
+                    message="Ce compte ne figure pas parmi ceux que le jeton "
+                            "voit. Rien n'a été enregistré.",
+                    code=400, comptes=comptes, comptes_erreur=erreur_comptes)
+            change["compte"] = voulu
+
+        for nom, effectif in (("ecriture", infomaniak_mcp.ecriture_armee()),
+                              ("achat", infomaniak_mcp.achat_arme())):
+            if (nom in form) != bool(effectif):
+                change[nom] = nom in form
+
+        # Le plafond se relit avec la MÊME fonction que la résolution : on ne
+        # peut pas enregistrer un plafond que la commande refuserait ensuite de
+        # lire.
+        try:
+            propose_plafond = plafond_lisible(form.get("plafond") or "")
+        except ErreurInfomaniak as err:
+            return self._rendre_config(
+                message="%s Rien n'a été enregistré." % err, code=400,
+                comptes=comptes, comptes_erreur=erreur_comptes)
+        try:
+            if propose_plafond != plafond_regle():
+                change["plafond"] = propose_plafond
+        except ErreurInfomaniak:
+            # Le plafond en place est illisible : toute valeur lisible est un
+            # changement, et c'est justement ce qu'on vient réparer.
+            change["plafond"] = propose_plafond
+
+        if not change:
+            return self._redirect("/config?fait=inchange")
+
+        with _config_lock:
+            fichier, _ = config_lire()
+            fichier.update(change)
+            durable = config_ecrire(fichier)
+            journalise = journal_ajouter(self._qui(), sorted(change)) if durable else False
+        if not durable:
+            return self._send(500, page_refus(
+                "Impossible d'enregistrer les réglages",
+                "Le volume n'est pas accessible en écriture, et rien n'a été "
+                "changé. Les outils continuent d'appliquer les réglages "
+                "précédents."))
+        # Après l'écriture, jamais avant : ce qu'`infomaniak_mcp` avait retenu
+        # de l'ancien réglage — le compte deviné, les domaines du compte
+        # épinglé — répondrait sinon depuis un monde qui n'existe plus.
+        oublier_les_caches()
+        return self._redirect("/config?fait=%s"
+                              % ("enregistre" if journalise else "muet"))
+
+    def _config_eprouver(self):
+        """Appelle l'API en LECTURE et rend ce qu'elle voit. N'écrit rien.
+
+        Le jeton anti-CSRF est exigé bien qu'aucun réglage ne bouge : sans lui,
+        une page hostile ferait battre l'API Infomaniak au rythme qu'elle
+        choisit, avec le jeton du serveur et sous l'identité de Vincent.
+        """
+        if not self._humain_present():
+            return self._defi_humain()
+        refus = self._garde_soumission()
+        if refus is not None:
+            return refus
+        form = self._form_stricte()
+        if isinstance(form, RefusCorps):
+            return self._refus_corps(form)
+        if form is None:
+            return self._send(400, page_refus("Demande mal formée", "Corps illisible."))
+        if not self._config_jeton_csrf(form):
+            return self._config_perime()
+
+        epreuve = {"comptes": None, "domaines": None, "erreur": ""}
+        comptes, erreur = self._liste_des_comptes()
+        if comptes is None:
+            epreuve["erreur"] = erreur
+            return self._rendre_config(epreuve=epreuve, comptes=None,
+                                       comptes_erreur=erreur)
+        epreuve["comptes"] = comptes
+        epingle = infomaniak_mcp.compte_epingle()
+        if epingle:
+            try:
+                # Le cache est vidé D'ABORD : répondre depuis ce qu'on a retenu
+                # ne prouverait rien sur le jeton d'aujourd'hui, et c'est la
+                # seule question posée ici.
+                infomaniak_mcp._DOMAINES_DU_COMPTE.pop(epingle, None)
+                epreuve["domaines"] = len(infomaniak_mcp.domaines_du_compte() or [])
+            except ErreurInfomaniak as err:
+                epreuve["erreur"] = str(err)
+            except Exception as err:                      # noqa: BLE001
+                epreuve["erreur"] = "%s: %s" % (type(err).__name__, err)
+        return self._rendre_config(epreuve=epreuve, comptes=comptes)
+
     def _whoami(self):
         """Quel artefact tourne ici — et rien d'autre.
 
@@ -1916,7 +2864,17 @@ class Poignee(BaseHTTPRequestHandler):
         ne protégerait rien — un serveur sans marque REFUSE tout ce qui ne
         vient pas de lui-même — et l'annoncer donne le seul moyen de constater
         de dehors qu'un déploiement est bien fermé.
+
+        Les deux armements sont ceux qui S'APPLIQUENT, c'est-à-dire ceux du
+        fichier de réglages dès qu'il existe. C'est la seule lecture qui
+        réponde à la question posée — « ce déploiement peut-il écrire ? » —, et
+        c'est elle qui permet de constater qu'un réglage a survécu à un
+        redémarrage. `reglages` dit seulement d'où ils viennent : ni le jeton,
+        ni son existence, ni le compte épinglé n'apparaissent, et savoir qu'un
+        fichier de configuration existe n'apprend rien à qui ne peut pas le
+        lire.
         """
+        _, etat_fichier = config_lire()
         return self._json(200, {
             "service": infomaniak_mcp.NAME,
             "version": infomaniak_mcp.VERSION,
@@ -1926,6 +2884,7 @@ class Poignee(BaseHTTPRequestHandler):
             "ecriture_armee": infomaniak_mcp.ecriture_armee(),
             "achat_arme": infomaniak_mcp.achat_arme(),
             "marque_proxy": bool(MARQUE_PROXY),
+            "reglages": etat_fichier,
         })
 
     # ---- routage ---------------------------------------------------------
@@ -1962,6 +2921,9 @@ class Poignee(BaseHTTPRequestHandler):
                                     "error_description": "POST attendu"},
                               extra=[("Allow", "POST")])
 
+        if chemin == "/config":
+            return self._config()
+
         if chemin == "/":
             return self._accueil()
 
@@ -1980,6 +2942,10 @@ class Poignee(BaseHTTPRequestHandler):
             return self._consent()
         if chemin == "/revoke":
             return self._revoke()
+        if chemin == "/config":
+            return self._config_poster()
+        if chemin == "/config/eprouver":
+            return self._config_eprouver()
 
         # /authorize en POST n'existe pas : c'est /consent, et lui seul, qui
         # émet un code. Confondre les deux est exactement la faille qu'on évite.
