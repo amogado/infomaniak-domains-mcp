@@ -47,43 +47,6 @@ spec:
       protocol: TCP
 ---
 # ---------------------------------------------------------------------------
-# Le Basic Auth — GARDÉ EN PLACE, ET INERTE.
-#
-# Plus aucune route ne le référence : l'authentification humaine est passée au
-# compte Google, dans le side-car. Cet objet ne fait donc rien aujourd'hui, et
-# c'est exactement pour ça qu'il reste — un middleware qu'on supprime est un
-# retour arrière qu'on doit réécrire sous la pression, le soir où Google, le
-# client OAuth ou la liste nominative pose un problème.
-#
-# Le retour arrière, honnêtement : DEUX commandes, pas une.
-#
-#   M=infomaniak-domains-default-infomaniak-domains
-#   kubectl -n infomaniak-domains-default patch svc infomaniak-domains \
-#     --type=json -p '[{"op":"replace","path":"/spec/ports/0/targetPort","value":8080}]'
-#   kubectl -n infomaniak-domains-default annotate ingress infomaniak-domains --overwrite \
-#     "traefik.ingress.kubernetes.io/router.middlewares=$M-auth@kubernetescrd,$M-marque@kubernetescrd"
-#
-# La première seule laisserait le proxy Google devant sans que Traefik demande
-# quoi que ce soit ; la seconde seule empilerait le mot de passe DEVANT Google
-# au lieu de le remplacer. Et l'une comme l'autre est défaite au prochain
-# `./deploy.sh` : le dépôt est la source de vérité, donc un retour arrière qui
-# doit durer se commite ici.
-#
-# Le Secret infomaniak-domains-basicauth n'est PAS dans ce dépôt.
-# Sa création — le mot de passe ne quitte jamais le terminal — est dans
-# deploy.sh, qui continue d'exiger ce Secret : un Middleware dont le Secret a
-# disparu rend 500, et on l'apprendrait au pire moment, celui du retour arrière.
-# ---------------------------------------------------------------------------
-apiVersion: traefik.io/v1alpha1
-kind: Middleware
-metadata:
-  name: infomaniak-domains-auth
-spec:
-  basicAuth:
-    secret: infomaniak-domains-basicauth
-    realm: domaines
----
-# ---------------------------------------------------------------------------
 # La marque du proxy — le second middleware de l'Ingress humain (dette D1)
 # ---------------------------------------------------------------------------
 #

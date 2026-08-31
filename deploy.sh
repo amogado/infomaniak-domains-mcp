@@ -29,19 +29,11 @@
 #    rejouer. Surtout pas `create --dry-run=client -o yaml | apply`, qui
 #    imprimerait le secret en base64 sur le terminal.
 #
-# 2. Le htpasswd du Basic Auth. Il ne sert PLUS À RIEN au quotidien : la porte
-#    humaine est passée au compte Google, et plus aucune route ne référence le
-#    Middleware `infomaniak-domains-auth`. On le garde, et ce script continue de
-#    l'exiger, parce qu'il EST le retour arrière (voir k8s/networking.yaml) — un
-#    Middleware dont le Secret a disparu rend 500, et on l'apprendrait le seul
-#    soir où l'on en a besoin. htpasswd -n demande le mot de passe sans
-#    l'afficher et n'imprime que le condensat :
-#
-#      htpasswd -nB vincent \
-#        | kubectl -n infomaniak-domains-default create secret generic \
-#            infomaniak-domains-basicauth --from-file=users=/dev/stdin
-#
-#    La clé s'appelle `users` : c'est celle que le middleware Traefik lit.
+# 2. (Supprimé le 2026-08-31.) Le Basic Auth a été retiré — Middleware et
+#    Secret compris. La porte humaine est le compte Google, et il n'y a
+#    plus de retour arrière d'une commande : le rétablir demanderait de
+#    recréer le Secret et le Middleware. Décision prise en connaissance
+#    de cause.
 #
 # 3. La marque du proxy (dette D1) — le secret partagé entre Traefik et le
 #    conteneur. Personne n'a besoin de la connaître : ni vous, ni Vincent. Elle
@@ -131,8 +123,7 @@ echo "==> Vérifications"
 # alors sur la boucle locale. Personne ne pourrait plus autoriser Claude, et
 # rien n'aurait l'air cassé. C'est exactement le genre de panne qu'on paye une
 # demi-journée ; on la refuse ici, en une ligne.
-for s in infomaniak-token infomaniak-domains-basicauth infomaniak-marque-proxy \
-         infomaniak-domains-oauth; do
+for s in infomaniak-token infomaniak-marque-proxy infomaniak-domains-oauth; do
   if ! $K get secret "$s" >/dev/null 2>&1; then
     echo "   Secret « $s » absent du namespace $NS." >&2
     echo "   Sa création est documentée en tête de ce fichier." >&2

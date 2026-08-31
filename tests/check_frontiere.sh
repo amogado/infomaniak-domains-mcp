@@ -35,7 +35,30 @@ sonde () {  # sonde <méthode> <chemin> <attendu> <motif www-authenticate|-> <po
   code=$(printf '%s' "$sortie" | awk 'toupper($0) ~ /^HTTP\// {print $2}' | tail -1)
   auth=$(printf '%s' "$sortie" | tr -d '\r' | awk 'tolower($0) ~ /^www-authenticate:/ {sub(/^[^:]*: */,""); print; exit}')
   local ok=1
-  [ "$code" = "$attendu" ] || ok=0
+  if [ "$attendu" = "ferme" ]; then
+    # « ferme » : le chemin ne doit pas être servi. La FORME du refus dépend de
+    # l'authentification humaine du moment — 401 Basic hier, 302 vers Google
+    # aujourd'hui. Éprouver le mécanisme ferait virer ce test au rouge à chaque
+    # bascule, alors que l'invariant, lui, ne bouge pas : rien ne doit sortir.
+    case "$code" in
+      401|403) ;;
+      302|303|307)
+        local vers
+        vers=$(printf '%s' "$sortie" | tr -d '\r' | awk 'tolower($0) ~ /^location:/ {sub(/^[^:]*: */,""); print; exit}')
+        case "$vers" in
+          https://accounts.google.com/*|https://*/oauth2/start*) ;;
+          *) ok=0 ;;   # une redirection ailleurs qu'une authentification est une fuite
+        esac ;;
+      *) ok=0 ;;
+    esac
+    local corps
+    corps=$(curl -sS -m 15 "$HOTE$chemin" 2>/dev/null | head -c 4000)
+    case "$corps" in
+      *Enregistrer*|*"Jeton d'API"*|*infomaniak-domains-claude*) ok=0 ;;
+    esac
+  else
+    [ "$code" = "$attendu" ] || ok=0
+  fi
   if [ "$motif" != "-" ]; then
     case "$auth" in $motif) ;; *) ok=0 ;; esac
   fi
@@ -52,13 +75,15 @@ sonde () {  # sonde <méthode> <chemin> <attendu> <motif www-authenticate|-> <po
 }
 
 echo "== ce qui doit RESTER fermé à un inconnu =="
-for chemin in / /read/x /s/x /m/x /api/documents /api/stats /api/library /api/highlights/x /connect; do
-  sonde GET "$chemin" 401 'Basic*' \
-    "ce chemin expose la lecture, les notes ou les statistiques : il doit rendre 401 Basic"
+# Les chemins humains de CE connecteur. /config est le plus sensible : il
+# pose le jeton d'API et arme la dépense.
+for chemin in / /config /revoke; do
+  sonde GET "$chemin" ferme - \
+    "ce chemin règle le connecteur ou révoque des accès : il ne doit rien servir à un inconnu"
 done
-sonde GET /authorize 401 'Basic*' \
+sonde GET /authorize ferme - \
   "la page de consentement doit être atteinte par un navigateur qui a déjà le mot de passe"
-sonde POST /consent 401 'Basic*' \
+sonde POST /consent ferme - \
   "le seul endroit qui émet un code d'autorisation ne doit jamais être joignable sans identifiants"
 
 echo
@@ -135,11 +160,16 @@ sonde_forgee () {
          -H 'X-Infomaniak-Proxy: marque-forgee-par-un-inconnu' \
          -H 'X-Forwarded-User: vincent' \
          "$HOTE$chemin" 2>/dev/null)
-  if [ "$code" = "401" ]; then
+  # Un refus direct (401/403) ou une redirection vers l'authentification : les
+  # deux disent « l'en-tête forgé n'a pas ouvert ». Depuis qu'oauth2-proxy est
+  # devant, le faux en-tête n'atteint même plus l'application — c'est un
+  # résultat plus fort, pas plus faible, et exiger 401 le prendrait pour un
+  # échec.
+  if [ "$code" = "401" ] || [ "$code" = "403" ] || [ "$code" = "302" ]; then
     VERTS=$((VERTS+1)); printf '  ok   %-6s %-46s %s\n' GET "$chemin (en-têtes forgés)" "$code"
   else
     ROUGES=$((ROUGES+1))
-    printf '  FAIL %-6s %-46s %s (attendu 401)\n' GET "$chemin (en-têtes forgés)" "${code:-aucun}"
+    printf '  FAIL %-6s %-46s %s (attendu un refus ou une redirection)\n' GET "$chemin (en-têtes forgés)" "${code:-aucun}"
     printf '       %s\n' "un inconnu qui écrit lui-même la marque du proxy entre : c'est \
 exactement la faille que D1 ferme, et elle serait rouverte"
     ECHECS+=("GET $chemin forgé")
@@ -151,7 +181,7 @@ sonde_forgee /authorize
 echo
 echo "== l'exemption doit être EXACTE, pas un préfixe =="
 for chemin in /mcpXXX /tokenXXX /registerXXX /_whoamiXXX /.well-known/oauth-authorization-serverXXX; do
-  sonde GET "$chemin" 401 'Basic*' \
+  sonde GET "$chemin" ferme - \
     "un pathType Prefix exempterait aussi ce chemin — Traefik traduit Prefix en préfixe de CHAÎNE, \
 pas de segment, et toute route future sous un chemin exempté deviendrait publique en silence"
 done
